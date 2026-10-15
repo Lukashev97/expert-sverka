@@ -19,14 +19,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Build number
+        run: python -c "open('build_info.py', 'w').write('BUILD = ${{ github.run_number }}\n')"
       - run: python test_sverka.py
+      - name: Update swap (Windows)
+        if: runner.os == 'Windows'
+        run: python test_sverka.py --swap
       - name: Build Sverka.exe
         if: runner.os == 'Windows'
         run: pyinstaller --onefile --windowed --name Sverka sverka.py
       - name: Check Sverka.exe (console twin, so errors are visible)
         if: runner.os == 'Windows'
         run: |
-          reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv
           pyinstaller --onefile --console --name SverkaCheck sverka.py
           python test_sverka.py --frozen dist/SverkaCheck.exe
       - name: Build Sverka.app
@@ -41,3 +45,23 @@ jobs:
           path: |
             dist/Sverka.exe
             dist/Sverka-macos.zip
+
+  # Релиз build-N — по нему приложение узнаёт о новой версии и скачивает её.
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          gh release create "build-${{ github.run_number }}" dist/Sverka.exe dist/Sverka-macos.zip \
+            --repo "${{ github.repository }}" --title "Сборка ${{ github.run_number }}" --notes "$NOTES"

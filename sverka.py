@@ -9,15 +9,20 @@
 """
 import argparse
 import datetime as dt
+import hashlib
 import html
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
+import urllib.request
 import warnings
+import webbrowser
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +48,11 @@ LATIN_LOOKALIKES = str.maketrans("aceopxykmthb", "асеорхукмтнв")
 SITE = "https://expertonline.t8s.ru"  # пароль уходит только сюда; ссылки PDF на другие адреса пропускаются
 GROUP_PATH = re.compile(r"/Learner/(?:Group/)?(\d+)/?")
 ZERO = Decimal(0)
+try:
+    from build_info import BUILD  # номер сборки пишет CI перед PyInstaller
+except ImportError:
+    BUILD = 0  # запуск из исходников — обновления не проверяем
+RELEASES_API = "https://api.github.com/repos/Lukashev97/expert-sverka/releases/latest"
 
 
 class LoginError(Exception):
@@ -486,6 +496,82 @@ def summary(rows):
             f" Неоднозначно: {n['ambiguous']}. Ошибок загрузки: {n['error']}.")
 
 
+# ---------- обновление ----------
+
+def _tls():
+    # Собранное .app ищет сертификаты там, где они лежали у Python на машине сборки; на macOS берём системные.
+    if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem"):
+        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    return ssl.create_default_context()
+
+
+def _http(url, timeout):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Sverka"}),
+                                  timeout=timeout, context=_tls())
+
+
+def asset_name():
+    return "Sverka.exe" if sys.platform == "win32" else "Sverka-macos.zip"
+
+
+def find_update(release, build=BUILD):
+    """Сборка новее нашей из ответа GitHub releases/latest — или None."""
+    m = re.fullmatch(r"build-(\d+)", str(release.get("tag_name", "")))
+    asset = next((a for a in release.get("assets") or [] if a.get("name") == asset_name()), None)
+    if not m or int(m[1]) <= build or not asset:
+        return None
+    return {"build": int(m[1]), "page": release.get("html_url", ""), "asset": asset}
+
+
+def check_update(api=RELEASES_API, build=BUILD):
+    if not build:
+        return None
+    with _http(api, 5) as r:
+        return find_update(json.load(r), build)
+
+
+def download(asset, dest, progress=lambda done, total: None):
+    """Скачивает файл релиза и сверяет размер и SHA-256 (GitHub отдаёт его в поле digest)."""
+    h, done, total = hashlib.sha256(), 0, asset["size"]
+    with _http(asset["browser_download_url"], 60) as r, open(dest, "wb") as f:
+        while chunk := r.read(1 << 16):
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            if done == total or done % (1 << 20) < len(chunk):  # примерно раз в мегабайт
+                progress(done, total)
+    digest = asset.get("digest") or ""
+    if done != total or (digest.startswith("sha256:") and digest[7:] != h.hexdigest()):
+        os.remove(dest)
+        raise ValueError("скачанный файл повреждён — попробуйте ещё раз")
+
+
+# Запущенный .exe нельзя перезаписать: подменяет cmd после нашего выхода и запускает новую версию.
+# Пути — в переменных окружения, чтобы кириллица в пути не ломалась о кодировку .cmd-файла.
+SWAP_CMD = """@echo off
+set n=0
+:retry
+move /y "%SVERKA_NEW%" "%SVERKA_EXE%" >nul 2>&1 && goto run
+set /a n+=1
+if %n% geq 120 goto end
+ping -n 2 127.0.0.1 >nul
+goto retry
+:run
+start "" "%SVERKA_EXE%" %SVERKA_ARGS%
+:end
+del "%~f0"
+"""
+
+
+def swap_after_exit(new, exe, args=""):
+    script = Path(tempfile.gettempdir()) / f"sverka-update-{os.getpid()}.cmd"
+    script.write_text(SWAP_CMD.replace("\n", "\r\n"), encoding="ascii")
+    env = dict(os.environ, SVERKA_NEW=str(new), SVERKA_EXE=str(exe), SVERKA_ARGS=args)
+    subprocess.Popen(["cmd", "/c", str(script)], env=env, cwd=str(Path(exe).parent),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=subprocess.CREATE_NO_WINDOW)
+
+
 def open_file(path):
     if sys.platform == "win32":
         os.startfile(path)
@@ -503,6 +589,7 @@ button { padding: 6px 14px; font: inherit }
 progress { width: 100%; margin: 10px 0 }
 pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; padding: 8px; margin: 0; white-space: pre-wrap }
 </style>
+<div class="row" id="upd" style="display: none"><b id="updtext"></b><button id="updbtn" onclick="doUpdate()"></button></div>
 <div class="row"><button onclick="pick('xlsx')">Таблица xlsx…</button><span id="xlsx">не выбрана</span></div>
 <div class="row"><button onclick="pick('pdf')">PDF со ссылками…</button><span id="pdf">не выбран</span></div>
 <div class="row"><button id="go" onclick="go()">Сверить</button>
@@ -524,6 +611,20 @@ function go() {
 function say(msg) { const l = document.getElementById("log"); l.textContent += msg + "\\n"; l.scrollTop = l.scrollHeight; }
 function progress(i, n) { const b = document.getElementById("bar"); b.max = Math.max(n, 1); b.value = i; }
 function done() { document.getElementById("go").disabled = false; }
+async function checkUpdate() {
+  const u = await pywebview.api.check_update();
+  if (!u) return;
+  document.getElementById("updtext").textContent = "Доступна новая версия — сборка " + u.build + ".";
+  document.getElementById("updbtn").textContent = u.auto ? "Обновить" : "Скачать";
+  document.getElementById("upd").style.display = "flex";
+}
+function doUpdate() {
+  if (document.getElementById("go").disabled) { say("Дождитесь окончания сверки."); return; }
+  document.getElementById("updbtn").disabled = true;
+  pywebview.api.update();
+}
+if (window.pywebview && window.pywebview.api && window.pywebview.api.check_update) checkUpdate();
+else window.addEventListener("pywebviewready", checkUpdate);
 </script>"""
 
 
@@ -544,6 +645,33 @@ class Api:  # методы доступны странице приложени�
     def _progress(self, i, n, msg):
         self._js("progress", i, n)
         self._js("say", f"[{i}/{n}] {msg}" if i else msg)
+
+    _update = None
+
+    def check_update(self):
+        try:
+            self._update = check_update()
+        except Exception:  # нет интернета или GitHub недоступен — работаем на текущей версии
+            self._update = None
+        return {"build": self._update["build"], "auto": sys.platform == "win32"} if self._update else None
+
+    def update(self):
+        threading.Thread(target=self._do_update, daemon=True).start()
+
+    def _do_update(self):
+        u = self._update
+        if sys.platform != "win32":  # на macOS — страница релиза, .app заменить вручную
+            return webbrowser.open(u["page"])
+        exe = Path(sys.executable)
+        new = exe.with_name(exe.name + ".new")
+        try:
+            self._js("say", f"Скачиваю сборку {u['build']}…")
+            download(u["asset"], new, lambda done, total: self._js("progress", done, total))
+            swap_after_exit(new, exe)
+            self._js("say", "Готово — программа перезапустится уже новой версией.")
+            os._exit(0)
+        except Exception as e:
+            self._js("say", f"Не удалось обновить: {e}")
 
     def _work(self, xlsx, pdf):
         web = None
@@ -583,7 +711,8 @@ def gui():
                "установите «Evergreen Bootstrapper» и запустите программу снова.", "Сверка", 0x30)
         return webbrowser.open(WEBVIEW2_URL)
     api = Api()
-    api._win = webview.create_window("Сверка ExpertOnline", html=APP_HTML, js_api=api, width=820, height=560)
+    title = f"Сверка ExpertOnline — сборка {BUILD}" if BUILD else "Сверка ExpertOnline"
+    api._win = webview.create_window(title, html=APP_HTML, js_api=api, width=820, height=580)
     webview.start(private_mode=True)
 
 

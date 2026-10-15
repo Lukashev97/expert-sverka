@@ -7,3 +7,5 @@ __pycache__/
 *.pdf
 *.docx
 .build/
+build_info.py
+.DS_Store

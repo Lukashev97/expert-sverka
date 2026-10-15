@@ -2,12 +2,17 @@
 
     python test_sverka.py                  # ядро сверки и отчёт
     python test_sverka.py --frozen <exe>   # собранное приложение целиком: окно сайта, вход, чтение страниц
+    python test_sverka.py --swap           # Windows: подмена запущенного .exe при обновлении
 """
+import hashlib
 import html
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 from decimal import Decimal
@@ -119,6 +124,8 @@ class FakeHolliHop(BaseHTTPRequestHandler):
             return self._send(200, LOGIN_PAGE.format(action=html.escape(self.path), login=LOGIN, password=PASSWORD))
         if path in ("/", "/favicon.ico"):
             return self._send(200, "<p>Главная</p>")
+        if path == "/asset":  # «файл релиза» для проверки обновления
+            return self._send(200, "new")
         if ".ASPXAUTH=ok" not in (self.headers.get("Cookie") or ""):
             return self._send(302, headers=[("Location", "/Account/LogOn?ReturnUrl=" + urllib.parse.quote(path))])
         parts = path.strip("/").split("/")
@@ -197,8 +204,47 @@ def main():
     check_report(out)
     assert sverka.parse_money("−1\u00a0234,50 руб.") == Decimal("-1234.50")
     assert sverka.parse_group_name("26/27 октябрьГК ОБЩ ПРО + ВГ") == ("ОБЩ", "Октябрь", "про+вг")
+    check_updates(base)
     server.shutdown()
     print("ok:", sverka.summary(rows))
+
+
+def check_updates(base):
+    asset = {"name": sverka.asset_name(), "size": 3, "browser_download_url": base + "/asset",
+             "digest": "sha256:" + hashlib.sha256(b"new").hexdigest()}
+    release = {"tag_name": "build-7", "html_url": "https://example.com/r/7", "assets": [asset]}
+    assert sverka.find_update(release, 6)["build"] == 7
+    assert sverka.find_update(release, 7) is None, "та же сборка — не обновление"
+    assert sverka.find_update(dict(release, tag_name="v1.0"), 1) is None
+    assert sverka.find_update(dict(release, assets=[]), 6) is None, "нет файла для этой ОС"
+    assert sverka.check_update(build=0) is None, "из исходников обновления не проверяются (и сеть не нужна)"
+    dest = Path(tempfile.mkdtemp()) / "Sverka.exe.new"
+    sverka.download(asset, dest)
+    assert dest.read_bytes() == b"new"
+    for bad in (dict(asset, digest="sha256:" + "0" * 64), dict(asset, size=4)):
+        try:
+            sverka.download(bad, dest)
+            raise AssertionError("битый файл должен отбрасываться")
+        except ValueError:
+            assert not dest.exists()
+
+
+def swap():
+    """Windows: подмена запущенного .exe скриптом обновления. Вместо Sverka — копии системных ping.exe и cmd.exe."""
+    d, sysdir = Path(tempfile.mkdtemp()), Path(os.environ["SystemRoot"]) / "System32"
+    exe, new = d / "Sverka.exe", d / "Sverka.exe.new"
+    shutil.copy(sysdir / "PING.EXE", exe)
+    shutil.copy(sysdir / "cmd.exe", new)
+    old = subprocess.Popen([str(exe), "-n", "4", "127.0.0.1"], stdout=subprocess.DEVNULL)  # «старая версия» ещё работает
+    sverka.swap_after_exit(new, exe, args="/c mkdir restarted")
+    old.wait()
+    for _ in range(60):
+        if (d / "restarted").exists():
+            break
+        time.sleep(1)
+    assert (d / "restarted").exists() and not new.exists(), list(d.iterdir())
+    assert exe.read_bytes() == (sysdir / "cmd.exe").read_bytes()
+    print("ok swap:", d)
 
 
 def frozen(exe):
@@ -223,4 +269,9 @@ def frozen(exe):
 
 
 if __name__ == "__main__":
-    frozen(sys.argv[2]) if sys.argv[1:2] == ["--frozen"] else main()
+    if sys.argv[1:2] == ["--frozen"]:
+        frozen(sys.argv[2])
+    elif sys.argv[1:2] == ["--swap"]:
+        swap()
+    else:
+        main()

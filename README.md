@@ -11,6 +11,15 @@
 
 Пароль программа не спрашивает и не хранит: вход делает человек на странице сайта. Потом программа только читает страницы групп из PDF (GET) — ничего на сайте не меняет. Ссылки PDF не на https://expertonline.t8s.ru пропускаются.
 
+## Обновления
+
+Каждая сборка из `main` публикуется как релиз `build-N` (в заголовке окна — номер текущей сборки). При запуске программа проверяет последний релиз; если он новее, вверху окна появляется «Доступна новая версия»:
+
+- **Windows** — кнопка «Обновить»: программа скачивает новый `Sverka.exe`, сверяет размер и SHA-256, закрывается, подменяет файл и запускается уже новой версией.
+- **macOS** — кнопка «Скачать» открывает страницу релиза; `Sverka.app` заменить вручную.
+
+Без интернета проверка просто пропускается. Сборки до появления обновлений (без номера в заголовке) нужно один раз скачать вручную со страницы Releases.
+
 ## Что с чем сравнивается
 
 | Группа на сайте | Значение в xlsx |
@@ -29,11 +38,12 @@
 pip install -r requirements.txt
 python test_sverka.py                    # самопроверка на синтетических данных и локальном фейковом сайте
 python test_sverka.py --frozen <Sverka>  # то же для собранного приложения: окно сайта, вход, чтение страниц
+python test_sverka.py --swap             # Windows: подмена запущенного .exe при обновлении
 python sverka.py                         # окно
 python sverka.py --xlsx t.xlsx --pdf c.pdf   # консоль (окно сайта для входа всё равно откроется)
 ```
 
-Сборка: `pyinstaller --windowed --name Sverka sverka.py` (macOS, `.app`) и `pyinstaller --onefile --windowed --name Sverka sverka.py` (Windows, `.exe`). PyInstaller не собирает под чужую ОС, поэтому `.exe` собирает GitHub Actions (`.github/workflows/build.yml`) — артефакты в разделе Actions.
+Сборка: `pyinstaller --windowed --name Sverka sverka.py` (macOS, `.app`) и `pyinstaller --onefile --windowed --name Sverka sverka.py` (Windows, `.exe`). PyInstaller не собирает под чужую ОС, поэтому `.exe` и `.app` собирает GitHub Actions (`.github/workflows/build.yml`): после зелёных проверок на `main` он публикует релиз `build-N`.
 
 Окно сайта на Windows работает через Microsoft Edge WebView2 (есть в Windows 10/11).
 
