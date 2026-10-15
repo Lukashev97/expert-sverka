@@ -39,10 +39,17 @@ PAGES = {  # id группы → (название, «Получено от пл
     5: ("26/27 сентябрь ГК МАТ ТВИКС", "1&#160;000,00 руб."),         # нет в xlsx, на сайте деньги
     6: ("25/26 на пересдачу: математика / базовый минимум", "0,00"),   # две группы → одна ячейка
     7: ("25/26 на пересдачу: математика / роскошный максимум", "43&#160;330,00 руб."),
-    8: ("С-П", "10&#160;000,00 руб."),                                 # алиас → «Стартер-пак»
+    8: ("С-П", "1&#160;500,00 руб."),                                  # алиас → «Стартер-пак»
     9: ("26/27 сентябрь ГК ОБЩ ПРО+ПА", "98&#160;671,00 руб."),
 }
 BROKEN = 10  # страница без «Получено от плательщиков»
+PAYMENTS = {  # id группы → строки списка «Оплаты»: плательщик (с инициалами, как на сайте), сумма, статус
+    2: [("Иванова А. Б.", "30&#160;000,00 руб.", "Оплачен"), ("Петров В. Г.", "45&#160;000,00 руб.", ""),
+        ("Сидорова Е. Е.", "999,00 руб.", "Счёт: №1 Не оплачен")],  # неоплаченный счёт не считается
+    5: [("Смирнов П. Р.", "1&#160;000,00 руб.", "Оплачен")],
+    8: [("Евсеенко К. В.", "1&#160;000,00 руб.", "Оплачен"), ("Кузнецова В. А.", "500,00 руб.", "Оплачен")],
+}
+PAGE_SIZE = {2: 1}  # по одной оплате на страницу — проверка листания списка
 LOGIN, PASSWORD = "test", "test-pass"
 FOREIGN = "http://evil.example/Learner/Group/1"  # первая ссылка PDF на чужой хост — пароль туда уходить не должен
 
@@ -57,6 +64,11 @@ def make_xlsx(path):
     for label, sep, oct_ in summary:
         ws.append(["ФАКТ", None, 1, 2, label, label])
         ws.append([None, None, "оплат", "оплат", sep, oct_])  # «оплат» над числом не должно стать подписью
+    ws["F5"] = "=SUMIF(F11:F30,F4,D11:D30)"  # как в настоящем файле: по формуле видно, каких учеников она складывает
+    for r, (name, paid) in enumerate([("Иванова Анна Борисовна", 30000), ("Петров Василий Глебович", 45105)], start=11):
+        ws.cell(r, 2, name)
+        ws.cell(r, 4, paid)
+        ws.cell(r, 6, "ГК профи 2")
     old = wb.create_sheet("ОБЩ ГК")  # прошлый год, другие тарифы — не должен мешать
     old.append(["Дата", "ФИО", *MONTHS, *MONTHS])
     old.append([None, None, None, None, "ГК pro+ПА", "ГК pro+ПА"])
@@ -66,14 +78,36 @@ def make_xlsx(path):
     mat.append([None, None, None, None, "ГК база", "ГК база"])
     mat.append([None, None, None, None, 0, 12502])
     for name, rows in [("МАТ спецкурсы", [("Все", 43330), ("На пересдачу", 43330)]),
-                       ("ОБЩ спецкурсы", [("Все", 9500), ("Стартер-пак", 9500)]),
+                       ("ОБЩ спецкурсы", [("Все", 1000), ("Стартер-пак", "=SUMIF(D5:D10,D3,C5:C10)")]),
                        ("ИСТ спецкурсы", [("Все", 500), ("для него в тарифе пустым оставлять", "Стартер-пак")])]:
         s = wb.create_sheet(name)
         s.append(["Дата", "ФИО", "Сумма", "Курс"])
         for course, total in rows:
             s.append(["Количество", 1, total, course])  # у ИСТ сумма съехала — как в настоящем файле
+    for r, name in enumerate(["Евсеенко Кристина Вячеславовна", "Кузнецова Вера Андреевна"], start=5):
+        for c, v in zip((2, 3, 4), (name, 500, "Стартер-пак")):
+            wb["ОБЩ спецкурсы"].cell(r, c, v)
+    for c, v in zip((2, 3, 4), ("Евсеенко Кристина Вячеславовна", 500, "Стартер-пак")):  # та же ученица на листе ИСТ
+        wb["ИСТ спецкурсы"].cell(4, c, v)
     wb.create_sheet("ЗП 26-27").append(["факт", 1, 2, "ГК база"])
     wb.save(path)
+
+
+def payments_page(gid, page):
+    rows, size = PAYMENTS.get(gid, []), PAGE_SIZE.get(gid, 15)
+    pages = max(1, -(-len(rows) // size))
+    trs = "".join(f'<tr><td>01.10.2026</td><td><a href="/Payment/Payer/1">{html.escape(p)}</a></td><td>{a}</td>'
+                  f'<td>{html.escape(st)}</td><td><a href="/Payment/RemoveLearnerPayment/{gid}">удалить</a></td></tr>'
+                  for p, a, st in rows[page * size:(page + 1) * size])
+    pager = "".join(f'<a class="page-link" href="/Payment/SearchLearnerPayments?LearnerId={gid}&Page={i}">{i + 1}</a>'
+                    for i in range(pages))
+    return ("<title>Оплаты</title><table><tr><th>Дата добавления</th><th>Плательщик</th><th>Размер оплаты</th>"
+            f"<th>Статус</th><th></th></tr>{trs}</table><div>{pager}</div><p>Всего найдено {len(rows)} оплат</p>")
+
+
+def static_payments(url):  # то же, что отдаёт фейковый сайт, — для проверки без окна
+    rows = [["01.10.2026", p, html.unescape(a), st] for p, a, st in PAYMENTS.get(int(url.rstrip("/").split("/")[-1]), [])]
+    return sverka.payment_rows(["Дата добавления", "Плательщик", "Размер оплаты", "Статус"], rows), "Всего найдено"
 
 
 def make_pdf(path, base):
@@ -132,6 +166,9 @@ class FakeHolliHop(BaseHTTPRequestHandler):
             return self._send(200, "new")
         if ".ASPXAUTH=ok" not in (self.headers.get("Cookie") or ""):
             return self._send(302, headers=[("Location", "/Account/LogOn?ReturnUrl=" + urllib.parse.quote(path))])
+        if path == "/Payment/SearchLearnerPayments":
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            return self._send(200, payments_page(int(q["LearnerId"][0]), int(q.get("Page", ["0"])[0])))
         parts = path.strip("/").split("/")
         if parts[:1] == ["Learner"] and parts[-1].isdigit() and len(parts) == 2:
             return self._send(302, headers=[("Location", f"/Learner/Group/{parts[-1]}")])
@@ -162,6 +199,8 @@ def check_report(out):
     text = "\n".join(c.text for t in doc.tables for row in t.rows for c in row.cells)
     assert "РАСХОЖДЕНИЕ" in text and "75\u00a0000,00" in text and "-105,00" in text, text[:500]
     paras = "\n".join(p.text for p in doc.paragraphs)
+    assert "Расхождения по ученикам" in paras and "Петров Василий Глебович" in text and "45\u00a0105,00" in text, text[-800:]
+    assert "Евсеенко К. В." in text and "Смирнов П. Р." in text and "Сидорова" not in text, "неоплаченный счёт не в отчёте"
     assert FOREIGN in paras and "«ИСТ спецкурсы», строка 3: в C вместо суммы «Стартер-пак»" in paras, paras
 
 
@@ -171,8 +210,9 @@ def check_read_only():
     assert log, "к сайту не обращались"
     assert {m for m, _ in log} <= {"GET", "POST"}, log
     assert all(urllib.parse.urlsplit(p).path == "/Account/LogOn" for m, p in log if m == "POST"), log
-    assert all(urllib.parse.urlsplit(p).path in ("/", "/favicon.ico", "/Account/LogOn") or p.startswith("/Learner/")
-               for m, p in log if m == "GET"), log
+    assert all(urllib.parse.urlsplit(p).path in ("/", "/favicon.ico", "/Account/LogOn", "/Payment/SearchLearnerPayments")
+               or p.startswith("/Learner/") for m, p in log if m == "GET"), log
+    assert not any("Remove" in p or "Edit" in p for _, p in log), "кнопки «удалить»/«изменить» на странице оплат не нажимаются"
 
 
 def main():
@@ -181,7 +221,7 @@ def main():
     opener.open(base + "/Account/LogOn", urllib.parse.urlencode({"LogLogin": LOGIN, "LogPassword": PASSWORD}).encode())
     fetch = lambda url: opener.open(base + sverka.group_path(url, base)).read().decode()
 
-    rows, links, skipped, problems = sverka.reconcile(xlsx, pdf, fetch, site=base)
+    rows, links, skipped, problems = sverka.reconcile(xlsx, pdf, fetch, site=base, payments=static_payments)
     sverka.write_report(out, rows, links, skipped, problems, xlsx, pdf)
     by_name = {g.name or g.url: r for r in rows for g in r.groups}
     status = {name: r.status for name, r in by_name.items()}
@@ -196,6 +236,11 @@ def main():
     assert retake is by_name["25/26 на пересдачу: математика / базовый минимум"] and retake.status == "ok"
     sp = by_name["С-П"]
     assert (sp.status, sp.diff, sp.cells) == ("diff", Decimal("500.00"), ["«ОБЩ спецкурсы»!C3"])
+    # кто из учеников дает расхождение: инициалы на сайте ↔ полное ФИО в xlsx
+    assert sp.students == [("Евсеенко К. В.", "Евсеенко Кристина Вячеславовна", Decimal("1000"), Decimal("500.00"),
+                            "«ИСТ спецкурсы» стр. 4")], sp.students  # вторая половина оплаты — на другом листе
+    assert r.students == [("Петров В. Г.", "Петров Василий Глебович", Decimal("45000"), Decimal("45105.00"), "")]
+    assert by_name["26/27 сентябрь ГК МАТ ТВИКС"].students == [("Смирнов П. Р.", "—", Decimal("1000"), Decimal("0"), "")]
     assert status[f"{base}/Learner/Group/{BROKEN}"] == "error"
     assert sum(len(r.groups) for r in rows) == len(PAGES) + 1  # + битая; повтор ссылки — один раз
     check_read_only()
@@ -210,6 +255,7 @@ def main():
     assert sverka.parse_group_name("26/27 октябрьГК ОБЩ ПРО + ВГ") == ("ОБЩ", "Октябрь", "про+вг")
     check_updates(base)
     check_daily()
+    check_names()
     server.shutdown()
     print("ok:", sverka.summary(rows))
 
@@ -322,6 +368,22 @@ def check_daily():
         raise AssertionError("месяц без плана должен давать понятную ошибку")
     except ValueError as e:
         assert "нет плана за 11.2026" in str(e)
+
+
+def check_names():
+    # в xlsx имя первым, на сайте «Фамилия И. О.» — это один человек, а не две гасящие друг друга строки
+    row = sverka.Row([sverka.Group("u", "g", Decimal(1500))], "diff", hits=[sverka.Entry(
+        "ОБЩ ГК ", "ОБЩ", "Сентябрь", "профи1", Decimal(1000), "L5",
+        [("Сабрина Русу Олеговна", Decimal(500), 29), ("Гусев Никита Дмитриевич", Decimal(500), 30)])])
+    people = {("ситникова", "в"): [("ОБЩ ГК", 537, "Ситникова Василиса Дмитриевна")],  # однофамилица, прошлый год
+              ("гусев", "н"): [("ОБЩ ГК", 40, "Гусев Никита Дмитриевич"), ("РУС ГК", 12, "Гусев Никита Дмитриевич")]}
+    pays = [("Русу С. О.", Decimal(500)), ("Гусев Н. Д.", Decimal(1500)), ("Ситникова В. М.", Decimal(100))]
+    sverka.student_diff(row, lambda url: (pays, ""), people, skip_sheets={"ОБЩ ГК"})
+    assert row.students == [("Гусев Н. Д.", "Гусев Никита Дмитриевич", Decimal(1500), Decimal(500), "«РУС ГК» стр. 12"),
+                            ("Ситникова В. М.", "—", Decimal(100), Decimal(0), "")], row.students
+    assert sverka.same_person("Евсеенко К. В.", "Евсеенко Кристина Вячеславовна")
+    assert not sverka.same_person("Ситникова Василиса Михайловна", "Ситникова Василиса Дмитриевна")
+    assert sverka.name_key("Cидорова Анна") == sverka.name_key("Сидорова А.")  # латинская C в xlsx
 
 
 def check_updates(base):

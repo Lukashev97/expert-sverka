@@ -38,7 +38,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.shared import Pt, RGBColor
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 MONTHS = [("сентяб", "Сентябрь"), ("октяб", "Октябрь"), ("ноябр", "Ноябрь"), ("декаб", "Декабрь"),
           ("январ", "Январь"), ("феврал", "Февраль"), ("март", "Март"), ("апрел", "Апрель"),
@@ -106,15 +106,33 @@ class Entry:  # одна итоговая ячейка xlsx
     label: str  # нормализованная подпись, напр. «профи2»
     value: Decimal
     cell: str
+    students: list | None = None  # [(ФИО, сумма, строка)] — кого складывает SUMIF ячейки; None — формула не SUMIF
+
+
+SUMIF_RE = re.compile(r'=SUMIF\(([A-Z]+)(\d+):([A-Z]+)(\d+),(?:([A-Z]+)(\d+)|"([^"]*)"),([A-Z]+)(\d+):([A-Z]+)(\d+)\)')
+
+
+def sumif_rows(ws, formula):
+    """Ученики, которых складывает формула сводки =SUMIF(диапазон; критерий; суммы): [(ФИО, сумма, строка)]."""
+    m = SUMIF_RE.fullmatch(str(formula or "").replace("$", "").replace(" ", ""))
+    if not m:
+        return None
+    crit = ws[f"{m[5]}{m[6]}"].value if m[5] else m[7]
+    cc, sc, shift = column_index_from_string(m[1]), column_index_from_string(m[8]), int(m[9]) - int(m[2])
+    name_col = next((c for c in range(1, 8) if norm(ws.cell(1, c).value or "") == "фио"), 2)
+    return [(ws.cell(r, name_col).value, _dec(ws.cell(r + shift, sc).value), r)
+            for r in range(int(m[2]), min(int(m[4]), ws.max_row) + 1)
+            if norm(ws.cell(r, cc).value or "") == norm(crit) and _is_num(ws.cell(r + shift, sc).value)]
 
 
 def load_xlsx(path):
-    """Итоговые ячейки из сводок наверху листов «… ГК» (месяц × тариф) и «… спецкурсы» (курс)
-    + замечания о строках сводки без суммы."""
-    entries, problems = [], []
+    """Итоговые ячейки из сводок наверху листов «… ГК» (месяц × тариф) и «… спецкурсы» (курс),
+    замечания о строках сводки без суммы и где в таблице встречается каждый ученик (по фамилии и инициалу)."""
+    entries, problems, people = [], [], {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        wb = openpyxl.load_workbook(path, data_only=True)  # значения
+        wbf = openpyxl.load_workbook(path)  # формулы сводок — по ним видно, каких учеников складывает ячейка
     for ws in wb.worksheets:
         tokens = re.findall(r"[\wё-]+", ws.title.casefold())
         subject = next(filter(None, map(subject_of, tokens)), None)
@@ -125,6 +143,19 @@ def load_xlsx(path):
         rows = [r + [None] * (width - len(r)) for r in rows]
         if not rows:
             continue
+        wf = wbf[ws.title]
+        name_col = next((c for c in range(1, 8) if norm(ws.cell(1, c).value or "") == "фио"), 2)
+        for r in range(2, ws.max_row + 1):
+            name = ws.cell(r, name_col).value
+            if isinstance(name, str) and len(name.split()) > 1:
+                people.setdefault(name_key(name), []).append((ws.title, r, name))
+
+        def amount(r, c):  # (сумма, ученики) ячейки r,c (0-based); без кэша значения — считаем SUMIF сами
+            students = sumif_rows(ws, wf.cell(r + 1, c + 1).value)
+            value = rows[r][c] if _is_num(rows[r][c]) else None
+            if value is None and students is not None:
+                value = sum((a for _, a, _ in students), ZERO)
+            return value, students
         if "гк" in tokens:
             # Шапка: месяцы дважды — сначала оплаты, потом тарифы. Сводка «подпись / сумма под ней»
             # стоит в колонках второго набора месяцев.
@@ -138,22 +169,25 @@ def load_xlsx(path):
                     continue
                 c = cs[-1]
                 for r in range(1, len(rows) - 1):
-                    label, value = rows[r][c], rows[r + 1][c]
-                    if isinstance(label, str) and label.strip() and _is_num(value):
+                    label = rows[r][c]
+                    if not (isinstance(label, str) and label.strip()):
+                        continue
+                    value, students = amount(r + 1, c)
+                    if value is not None:
                         lab = norm(label).removeprefix("гк")
-                        entries.append(Entry(ws.title, subject, m, lab, _dec(value), f"{get_column_letter(c + 1)}{r + 2}"))
+                        entries.append(Entry(ws.title, subject, m, lab, _dec(value), f"{get_column_letter(c + 1)}{r + 2}", students))
         elif any(t.startswith("спецкурс") for t in tokens):
             # Строки «Количество | N | сумма | Курс»
             for r in range(1, len(rows)):
                 a, c, d = rows[r][0], rows[r][2] if width > 2 else None, rows[r][3] if width > 3 else None
                 if not (isinstance(a, str) and a.strip().casefold() == "количество"):
                     continue
-                if not _is_num(c):
+                value, students = amount(r, 2)
+                if value is None:
                     problems.append(f"«{ws.title}», строка {r + 1}: в C вместо суммы {f'«{c}»' if c is not None else 'пусто'}")
                 elif isinstance(d, str) and norm(d) != "все":
-                    entries.append(Entry(ws.title, subject, None, norm(d), _dec(c), f"C{r + 1}"))
-    wb.close()
-    return entries, problems
+                    entries.append(Entry(ws.title, subject, None, norm(d), _dec(value), f"C{r + 1}", students))
+    return entries, problems, people
 
 
 def _is_num(v):
@@ -180,6 +214,20 @@ READ_PAGE_JS = """(() => {
   return {path: location.pathname,
           html: "<title>" + document.title + "</title>" + (cap ? cap.outerHTML : "") + (td ? td.parentElement.outerHTML : "")};
 })()"""
+PAYMENTS = "/Payment/SearchLearnerPayments"
+# Список оплат группы. В строках есть кнопки «изменить»/«удалить» — их не трогаем, читаем только текст таблицы.
+READ_PAYMENTS_JS = """(() => {
+  const t = Array.from(document.querySelectorAll("table")).find(t => t.querySelector("th") && t.textContent.includes("Плательщик"));
+  const cells = tr => Array.from(tr.children).map(c => c.textContent.replace(/\\s+/g, " ").trim());
+  const pages = Array.from(document.querySelectorAll("a.page-link"))
+    .map(a => +(((a.getAttribute("href") || "").match(/[?&]Page=(\\d+)/) || [0, 0])[1]));
+  return {path: location.pathname, search: location.search,
+          head: t ? Array.from(t.querySelectorAll("th")).map(th => th.textContent.trim()) : [],
+          rows: t ? Array.from(t.querySelectorAll("tr")).slice(1).map(cells) : [],
+          pages: Math.max(0, ...pages) + 1,
+          footer: ((document.body.textContent.match(/Всего найдено[^\\n]*/) || [""])[0]).trim()};
+})()"""
+SAFE_PATH = re.compile(r"/Learner/(?:Group/)?\d+/?|/Payment/SearchLearnerPayments\?LearnerId=\d+(?:&Page=\d+)?")
 CLOSED = "Окно сайта закрыто — сверка прервана."
 
 
@@ -213,7 +261,10 @@ class WebSession:
             return ""
 
     def _open(self, path, again):
-        if again and urllib.parse.urlsplit(self._url()).path.rstrip("/") == path.rstrip("/"):
+        if not SAFE_PATH.fullmatch(path):  # открываем только страницы групп и списки их оплат
+            raise ValueError(f"не читаем {path}")
+        u = urllib.parse.urlsplit(self._url())
+        if again and (u.path + (f"?{u.query}" if u.query else "")).rstrip("/") == path.rstrip("/"):
             # повтор: WebView2 молча игнорирует load_url на уже открытую страницу — пусть перезагрузится сама
             self.win.evaluate_js("setTimeout(() => location.reload(), 50)")
             self.win.events.loaded.clear()
@@ -226,10 +277,9 @@ class WebSession:
                 raise LoginError(CLOSED)
         raise TimeoutError("страница не загрузилась за 2 минуты")
 
-    def get(self, url):
-        """Окно само открывает страницу группы (как клик по ссылке), отдаём заголовок и строку статистики."""
-        path, err = group_path(url, self.site), None
-        want = GROUP_PATH.fullmatch(path)[1]
+    def _read(self, path, js, ok):
+        """Окно само открывает страницу (как клик по ссылке) и отдаёт то, что вернул js, если ok(результат)."""
+        err = None
         for attempt in range(2):
             if self.closed.is_set():
                 raise LoginError(CLOSED)
@@ -237,15 +287,33 @@ class WebSession:
             if "/account/logon" in self._url().casefold():
                 raise LoginError("Сайт попросил войти заново (сессия закончилась).")
             try:
-                r = self.win.evaluate_js(READ_PAGE_JS)
+                r = self.win.evaluate_js(js)
             except Exception as e:  # страница успела перезагрузиться сама — пробуем ещё раз
                 err = e
                 continue
-            m = GROUP_PATH.fullmatch(r.get("path", "")) if isinstance(r, dict) else None
-            if m and m[1] == want:  # прочитали именно ту группу, которую открывали
-                return r["html"]
+            if isinstance(r, dict) and ok(r):
+                return r
             err = f"открылась не та страница: {r.get('path') if isinstance(r, dict) else r}"
         raise ValueError(f"страница не прочиталась: {err}")
+
+    def get(self, url):
+        """Страница группы: заголовок и строка статистики."""
+        path = group_path(url, self.site)
+        want = GROUP_PATH.fullmatch(path)[1]
+        r = self._read(path, READ_PAGE_JS, lambda r: (m := GROUP_PATH.fullmatch(r.get("path", ""))) and m[1] == want)
+        return r["html"]
+
+    def payments(self, url):
+        """Оплаты группы со всех страниц списка «Оплаты»: [(плательщик, сумма)] и строка «Всего найдено …»."""
+        gid = GROUP_PATH.fullmatch(group_path(url, self.site))[1]
+        out, footer, page, pages = [], "", 0, 1
+        while page < min(pages, 300):
+            q = f"LearnerId={gid}" + (f"&Page={page}" if page else "")
+            r = self._read(f"{PAYMENTS}?{q}", READ_PAYMENTS_JS,
+                           lambda r: r.get("path") == PAYMENTS and f"LearnerId={gid}" in r.get("search", ""))
+            out += payment_rows(r["head"], r["rows"])
+            pages, footer, page = r["pages"], r["footer"], page + 1
+        return out, footer
 
     def close(self):
         if not self.closed.is_set():
@@ -267,6 +335,16 @@ def parse_group_page(text):
     if not m:
         raise ValueError("на странице нет «Получено от плательщиков»")
     return name, parse_money(html.unescape(re.sub(r"<[^>]+>", "", m.group(1))))
+
+
+def payment_rows(head, rows):
+    """Строки таблицы оплат → [(плательщик, сумма)]; неоплаченные счета не считаются."""
+    idx = {h.strip(): i for i, h in enumerate(head)}
+    ip, ia, ist = idx.get("Плательщик"), idx.get("Размер оплаты"), idx.get("Статус")
+    if ip is None or ia is None:
+        raise ValueError("на странице оплат нет колонок «Плательщик» / «Размер оплаты»")
+    return [(cells[ip], parse_money(cells[ia])) for cells in rows
+            if len(cells) > max(ip, ia) and not (ist is not None and len(cells) > ist and "не оплачен" in cells[ist].casefold())]
 
 
 def parse_money(s):
@@ -310,6 +388,9 @@ class Row:  # одна строка отчёта: группа (или неск�
     xlsx: Decimal | None = None
     cells: list = field(default_factory=list)
     note: str = ""
+    hits: list = field(default_factory=list)  # ячейки xlsx (Entry), с которыми сравнивали
+    students: list = field(default_factory=list)  # [(ученик на сайте, ученик в xlsx, сайт, xlsx)] — только расходящиеся
+    students_note: str = ""
 
     @property
     def site(self):
@@ -345,7 +426,7 @@ def match(groups, entries):
             if key in by_cells:  # несколько групп на сайте → одна ячейка xlsx: сравниваем сумму
                 by_cells[key].groups.append(g)
                 continue
-            row = Row([g], "", xlsx=sum((e.value for e in hits), ZERO), cells=[f"«{s}»!{c}" for s, c in key])
+            row = Row([g], "", xlsx=sum((e.value for e in hits), ZERO), cells=[f"«{s}»!{c}" for s, c in key], hits=hits)
             by_cells[key] = row
             rows.append(row)
     for row in by_cells.values():
@@ -355,9 +436,69 @@ def match(groups, entries):
     return rows
 
 
-def reconcile(xlsx, pdf, fetch, progress=lambda i, n, msg: None, site=SITE):
+def _name_tokens(name):
+    return re.findall(r"[a-zа-я]+", str(name or "").casefold().replace("ё", "е").translate(LATIN_LOOKALIKES))
+
+
+def name_key(name, swap=False):
+    """«Иванова Анна Сергеевна» и «Иванова А. С.» → ('иванова', 'а'): на сайте плательщик с инициалами.
+    swap — для имён, записанных в xlsx как «Имя Фамилия Отчество»."""
+    t = _name_tokens(name)
+    if swap and len(t) > 1:
+        t[0], t[1] = t[1], t[0]
+    return (t[0], t[1][0]) if len(t) > 1 else (t[0] if t else "", "")
+
+
+def same_person(a, b):
+    """Та же фамилия, а имя и отчество совпадают — целиком или по инициалу, если где-то записаны инициалами."""
+    ta, tb = _name_tokens(a), _name_tokens(b)
+    return bool(ta and tb) and ta[0] == tb[0] and all(
+        x[0] == y[0] and (len(x) == 1 or len(y) == 1 or x == y) for x, y in zip(ta[1:], tb[1:]))
+
+
+def student_diff(row, payments, people=None, skip_sheets=()):
+    """Кто из учеников даёт расхождение: оплаты групп на сайте против учеников, которых складывает ячейка xlsx."""
+    site, footers = [], []
+    for g in row.groups:
+        rows, footer = payments(g.url)
+        site += rows
+        footers.append(footer)
+    xl = [(name, amount) for e in row.hits for name, amount, _ in (e.students or [])]
+    counted = {(e.sheet, r) for e in row.hits for _, _, r in (e.students or [])}
+    notes = []
+    if any(e.students is None for e in row.hits):
+        notes.append("часть суммы xlsx — не формула SUMIF, учеников по ней не видно")
+    paid = sum((a for _, a in site), ZERO)
+    if row.site is not None and abs(paid - row.site) >= Decimal("0.01"):
+        notes.append(f"на сайте в списке оплат {fmt(paid)}, а «Получено от плательщиков» {fmt(row.site)}")
+    site_keys = {name_key(n) for n, _ in site}
+
+    def key(name, side):
+        k = name_key(name)
+        if side and k not in site_keys and name_key(name, swap=True) in site_keys:
+            return name_key(name, swap=True)  # в xlsx «Имя Фамилия», на сайте «Фамилия И.»
+        return k
+
+    by = {}
+    for side, items in ((0, site), (1, xl)):
+        for name, amount in items:
+            k = by.setdefault(key(name, side), [set(), set(), ZERO, ZERO])
+            k[side].add(str(name).strip())
+            k[2 + side] += amount
+
+    def elsewhere(k, names):  # где ещё в таблице этот ученик — частая причина: записан не в ту группу/лист
+        spots = [f"«{sh.strip()}» стр. {r}" for sh, r, full in (people or {}).get(k, [])
+                 if (sh, r) not in counted and sh not in skip_sheets and any(same_person(full, n) for n in names)]
+        return ", ".join(spots[:6]) + (" …" if len(spots) > 6 else "")
+
+    row.students = sorted((", ".join(sorted(s)) or "—", ", ".join(sorted(x)) or "—", a, b, elsewhere(k, s | x))
+                          for k, (s, x, a, b) in by.items() if abs(a - b) >= Decimal("0.01"))
+    row.students_note = "; ".join(notes + [f for f in footers if f])
+
+
+def reconcile(xlsx, pdf, fetch, progress=lambda i, n, msg: None, site=SITE, payments=None):
     links, skipped = pdf_links(pdf, site)
-    entries, problems = load_xlsx(xlsx)
+    entries, problems, people = load_xlsx(xlsx)
     groups = []
     for i, url in enumerate(links, 1):
         g = Group(url)
@@ -369,7 +510,20 @@ def reconcile(xlsx, pdf, fetch, progress=lambda i, n, msg: None, site=SITE):
             g.error = f"{type(e).__name__}: {e}"
         progress(i, len(links), f"{g.name or url}: {fmt(g.site) if g.error is None else g.error}")
         groups.append(g)
-    return match(groups, entries), links, skipped, problems
+    rows = match(groups, entries)
+    if payments:  # по группам с расхождением — кто из учеников его даёт
+        # листы со сводкой, ни одна ячейка которой не совпала с сайтом, — прошлый год: в «где ещё» не смотрим
+        skip = {e.sheet for e in entries} - {e.sheet for r in rows for e in r.hits}
+        bad = [r for r in rows if r.status in PROBLEM]
+        for i, row in enumerate(bad, 1):
+            progress(i, len(bad), f"Оплаты по ученикам: {', '.join(g.name for g in row.groups)}")
+            try:
+                student_diff(row, payments, people, skip)
+            except LoginError:
+                raise
+            except Exception as e:
+                row.students_note = f"не удалось разобрать по ученикам: {type(e).__name__}: {e}"
+    return rows, links, skipped, problems
 
 
 # ---------- отчёт ----------
@@ -460,6 +614,17 @@ def write_report(path, rows, links, skipped, problems, xlsx, pdf):
     else:
         doc.add_paragraph("Расхождений не найдено.")
 
+    detailed = [r for r in diffs if r.students or r.students_note]
+    if detailed:
+        doc.add_heading("Расхождения по ученикам", level=2)
+        for r in detailed:
+            doc.add_heading(f"{' + '.join(g.name or g.url for g in r.groups)}: сайт {fmt(r.site)}, xlsx {fmt(r.xlsx)}", level=3)
+            if r.students:
+                _table(doc, ["Ученик на сайте", "Ученик в xlsx", "Сайт, руб.", "xlsx, руб.", "Разница (сайт − xlsx)", "Где ещё в xlsx"],
+                       [[s, x, fmt(a), fmt(b), fmt(a - b), w] for s, x, a, b, w in r.students])
+            if r.students_note:
+                doc.add_paragraph(r.students_note)
+
     other = [r for r in rows if r.status in ("ambiguous", "error")]
     if other:
         doc.add_heading("Не удалось сверить", level=2)
@@ -485,7 +650,7 @@ def run(xlsx, pdf, web, out=None, progress=lambda i, n, msg: None, site=SITE):
     progress(0, 0, "Войдите на сайт в открывшемся окне — логин и пароль вводите сами.")
     web.wait_login()
     progress(0, 0, "Вход выполнен, читаю страницы групп…")
-    rows, links, skipped, problems = reconcile(xlsx, pdf, web.get, progress, site)
+    rows, links, skipped, problems = reconcile(xlsx, pdf, web.get, progress, site, payments=web.payments)
     out = out or str(Path(xlsx).with_name(f"Расхождения {dt.datetime.now():%Y-%m-%d %H-%M}.docx"))
     write_report(out, rows, links, skipped, problems, xlsx, pdf)
     return out, rows
