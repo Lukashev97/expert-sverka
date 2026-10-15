@@ -5,6 +5,7 @@
     python test_sverka.py --swap           # Windows: подмена запущенного .exe при обновлении
     python test_sverka.py --swap-frozen <Sverka.exe>  # Windows: собранный .exe подменяет себя и реально перезапускается
 """
+import difflib
 import hashlib
 import html
 import os
@@ -16,6 +17,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +27,7 @@ import openpyxl
 from pypdf import PdfWriter
 from pypdf.annotations import Link
 
+import daily
 import sverka
 
 MONTHS = ["Сентябрь", "Октябрь"]
@@ -206,8 +209,119 @@ def main():
     assert sverka.parse_money("−1\u00a0234,50 руб.") == Decimal("-1234.50")
     assert sverka.parse_group_name("26/27 октябрьГК ОБЩ ПРО + ВГ") == ("ОБЩ", "Октябрь", "про+вг")
     check_updates(base)
+    check_daily()
     server.shutdown()
     print("ok:", sverka.summary(rows))
+
+
+def make_daily_xlsx(path):
+    """Мини-таблица со всеми правилами отчета: возврат выше диапазона учеников, СВУ МВД со «штампом» даты
+    после дня отчета, латинская O в «ПРO+ПА», ученик после дня отчета, стартер-пак нарастающим итогом."""
+    d = lambda day, month=10: datetime(2026, month, day)
+    wb = openpyxl.Workbook()
+    zp = wb.active
+    zp.title = "ЗП 26-27"
+    zp["A3"], zp["A6"] = d(1), "Итого"
+    for col, (title, plan) in zip((2, 5, 8, 11), [("обществознание", 500000), ("история", 100000),
+                                                  ("русский язык", 50000), ("математика", 50000)]):
+        zp.cell(3, col, title)
+        zp.cell(6, col + 2, plan)
+    log = {"Обществознание": [(d(1), 5290), (d(1), 2145), (d(2), 4790), (d(30, 9), 999)],
+           "История": [(d(2), 4496)], "Русский язык": [], "Математика": []}
+    for col, (title, rows) in zip((20, 25, 30, 35), log.items()):
+        zp.cell(1, col, title)
+        for i, h in enumerate(("Дата", "ФИО", "Сумма")):
+            zp.cell(2, col + i, h)
+        for r, (day, amount) in enumerate(rows, start=3):
+            zp.cell(r, col, day)
+            zp.cell(r, col + 1, "Ученик")
+            zp.cell(r, col + 2, amount)
+    for subj in daily.SUBJ:
+        ws = wb.create_sheet(f"{subj} ГК")
+        ws.append(["Дата", "ФИО", "Сентябрь", "Октябрь", "Сентябрь", "Октябрь", "Тариф"])
+        summary = [("Сумма", "=SUM(C8:D100)"), ("Количество", "=COUNTA(B10:B100)"), ("БАЗА", "=COUNTIF(G10:G100,G4)"),
+                   ("ПРO+ПА", "=COUNTIF(G10:G100,G5)"), ("СВУ МВД", "=COUNTIF(G9:G100,G6)")]
+        for r, (label, formula) in enumerate(summary, start=2):
+            ws.cell(r, 7, label)
+            ws.cell(r, 8, formula)
+        if subj == "ОБЩ":
+            for r, row in {8: (d(1, 9), "Возврат", 1000, None, "БАЗА"), 9: (d(8), "Курсант", 2000, None, "СВУ МВД"),
+                           10: (d(15, 9), "Ученик 1", 3000, 3000, "БАЗА"), 11: (d(1), "Ученик 2", None, 5290, "ПРО+ПА"),
+                           12: (d(2), "Ученик 3", None, 4790, "БАЗА")}.items():
+                for c, v in zip((1, 2, 3, 4, 7), row):
+                    ws.cell(r, c, v)
+    sp = wb.create_sheet("ОБЩ спецкурсы")
+    sp.append(["Дата", "ФИО", "Сумма", "Курс"])
+    sp.append(["Количество", 1, 500, "Стартер-пак"])
+    sp.append([d(10, 9), "А", 500, "Стартер-пак"])
+    sp.append([d(5), "Б", 500, "Стартер-пак"])
+    wb.save(path)
+
+
+DAILY_OCT1 = """📌 Отчет за 1 октября:
+
+Всего обработано: 
+
+🔵 ОБЩЕСТВОЗНАНИЕ
+
+Получено оплат: 2
+Сумма оплат за сегодня: 7.435
+Процент выполнения плана: 7.435 от 500.000 - 1.49%
+
+Годовой курс: 2
+В деньгах: 14.290
+БАЗА 1 / ПРО+ПА 1 / СВУ МВД 1
+
+Стартер-пак: 1
+
+🟣 ИСТОРИЯ
+
+Получено оплат: 0
+Сумма оплат за сегодня: 0
+Процент выполнения плана: 0.00 от 100.000 - 0.00%
+
+Годовой курс: 0
+В деньгах: 0
+БАЗА 0 / ПРО+ПА 0 / СВУ МВД 0
+
+🟠 РУССКИЙ ЯЗЫК
+
+Получено оплат: 0
+Сумма оплат за сегодня: 0
+Процент выполнения плана: 0.00 от 50.000 - 0.00%
+
+Годовой курс: 0
+В деньгах: 0
+БАЗА 0 / ПРО+ПА 0 / СВУ МВД 0
+
+🔵 МАТЕМАТИКА
+
+Получено оплат: 0
+Сумма оплат за сегодня: 0
+Процент выполнения плана: 0.00 от 50.000 - 0.00%
+
+Годовой курс: 0
+В деньгах: 0
+БАЗА 0 / ПРО+ПА 0 / СВУ МВД 0"""
+
+
+def check_daily():
+    path = Path(tempfile.mkdtemp()) / "Ученики.xlsx"
+    make_daily_xlsx(path)
+    book = daily.Book(path)
+    got = book.report(datetime(2026, 10, 1).date())
+    assert got == DAILY_OCT1, "\n".join(difflib.unified_diff(DAILY_OCT1.splitlines(), got.splitlines(), lineterm=""))
+    oct2 = book.report(datetime(2026, 10, 2).date())  # день спустя: ученик 3 добавился, процент — с начала месяца
+    assert "Получено оплат: 1\nСумма оплат за сегодня: 4.790\nПроцент выполнения плана: 12.225 от 500.000 - 2.45%" in oct2
+    assert "Годовой курс: 3\nВ деньгах: 19.080\nБАЗА 2 / ПРО+ПА 1 / СВУ МВД 1" in oct2
+    assert daily.days(datetime(2026, 10, 3).date(), datetime(2026, 10, 1).date())[0].day == 1  # перепутанные даты
+    out = sverka.make_report(path, datetime(2026, 10, 1).date(), datetime(2026, 10, 2).date(), say=lambda m: None)
+    assert [p.text for p in docx.Document(out).paragraphs][:1] == ["📌 Отчет за 1 октября:"]
+    try:
+        book.report(datetime(2026, 11, 1).date())
+        raise AssertionError("месяц без плана должен давать понятную ошибку")
+    except ValueError as e:
+        assert "нет плана за 11.2026" in str(e)
 
 
 def check_updates(base):
@@ -281,7 +395,11 @@ def frozen(exe):
     check_report(out)
     check_read_only()
     server.shutdown()
-    print("ok frozen:", exe, "| запросов к сайту:", len(FakeHolliHop.log))
+    daily_xlsx, daily_out = out.with_name("Ученики.xlsx"), out.with_name("Отчет.docx")  # отчет внутри сборки
+    make_daily_xlsx(daily_xlsx)
+    subprocess.run([exe, "--xlsx", str(daily_xlsx), "--report-from", "2026-10-01", "--out", str(daily_out)], timeout=120)
+    assert "\n".join(p.text for p in docx.Document(daily_out).paragraphs) == DAILY_OCT1
+    print("ok frozen:", exe, "| запросов к сайту:", len(FakeHolliHop.log), "| отчет совпал")
 
 
 if __name__ == "__main__":

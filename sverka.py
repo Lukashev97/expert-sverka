@@ -31,6 +31,8 @@ import docx
 import openpyxl
 import pypdf
 import webview
+
+import daily
 from docx.enum.section import WD_ORIENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -574,6 +576,20 @@ def swap_after_exit(new, exe, args=""):
                      creationflags=subprocess.CREATE_NO_WINDOW)
 
 
+def make_report(xlsx, first, last=None, out=None, say=print):
+    """Ежедневные отчёты руководителю за день или диапазон — один docx рядом с таблицей."""
+    book = daily.Book(xlsx)
+    span = daily.days(first, last)
+    if book.last_log_day and span[-1] > book.last_log_day:
+        say(f"Внимание: журнал продаж в «{daily.ZP}» заполнен по {book.last_log_day:%d.%m.%Y} — "
+            "у более поздних дней оплаты будут нулевыми.")
+    texts = [book.report(d) for d in span]
+    name = f"Отчет {span[0]:%d.%m.%Y}" + (f"–{span[-1]:%d.%m.%Y}" if len(span) > 1 else "") + ".docx"
+    out = out or str(Path(xlsx).with_name(name))
+    daily.write_docx(texts, out)
+    return out
+
+
 def open_file(path):
     if sys.platform == "win32":
         os.startfile(path)
@@ -596,6 +612,9 @@ pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; p
 <div class="row"><button onclick="pick('pdf')">PDF со ссылками…</button><span id="pdf">не выбран</span></div>
 <div class="row"><button id="go" onclick="go()">Сверить</button>
   <span>Откроется окно сайта — войдите в нём сами, дальше программа только читает страницы групп.</span></div>
+<div class="row"><button id="rep" onclick="report()">Отчет</button>
+  <input type="date" id="dfrom"> — <input type="date" id="dto">
+  <span>одна дата или диапазон; нужна только таблица xlsx</span></div>
 <progress id="bar" value="0" max="1"></progress>
 <pre id="log"></pre>
 <script>
@@ -604,15 +623,26 @@ async function pick(kind) {
   const path = await pywebview.api.pick(kind);
   if (path) { files[kind] = path; document.getElementById(kind).textContent = path; }
 }
+function busy(on) { for (const id of ["go", "rep"]) document.getElementById(id).disabled = on; }
 function go() {
   if (!files.xlsx || !files.pdf) { say("Выберите таблицу xlsx и PDF."); return; }
-  document.getElementById("go").disabled = true;
+  busy(true);
   document.getElementById("log").textContent = "";
   pywebview.api.start(files.xlsx, files.pdf);
 }
+function report() {
+  const first = document.getElementById("dfrom").value, last = document.getElementById("dto").value;
+  if (!files.xlsx) { say("Выберите таблицу xlsx."); return; }
+  if (!first) { say("Выберите дату отчета."); return; }
+  busy(true);
+  document.getElementById("log").textContent = "";
+  pywebview.api.report(files.xlsx, first, last || first);
+}
+{ const t = new Date(); document.getElementById("dfrom").value =
+    new Date(t.getTime() - t.getTimezoneOffset() * 60000).toISOString().slice(0, 10); }
 function say(msg) { const l = document.getElementById("log"); l.textContent += msg + "\\n"; l.scrollTop = l.scrollHeight; }
 function progress(i, n) { const b = document.getElementById("bar"); b.max = Math.max(n, 1); b.value = i; }
-function done() { document.getElementById("go").disabled = false; }
+function done() { busy(false); }
 async function checkUpdate() {
   const u = await pywebview.api.check_update();
   if (!u) return;
@@ -621,7 +651,7 @@ async function checkUpdate() {
   document.getElementById("upd").style.display = "flex";
 }
 function doUpdate() {
-  if (document.getElementById("go").disabled) { say("Дождитесь окончания сверки."); return; }
+  if (document.getElementById("go").disabled) { say("Дождитесь окончания работы."); return; }
   document.getElementById("updbtn").disabled = true;
   pywebview.api.update();
 }
@@ -656,6 +686,24 @@ class Api:  # методы доступны странице приложени�
         except Exception:  # нет интернета или GitHub недоступен — работаем на текущей версии
             self._update = None
         return {"build": self._update["build"], "auto": sys.platform == "win32"} if self._update else None
+
+    def report(self, xlsx, first, last):
+        threading.Thread(target=self._report, args=(xlsx, first, last), daemon=True).start()
+
+    def _report(self, xlsx, first, last):
+        try:
+            self._js("say", "Читаю таблицу…")
+            say = lambda msg: self._js("say", msg)
+            out = make_report(xlsx, dt.date.fromisoformat(first), dt.date.fromisoformat(last), say=say)
+            self._js("say", f"Отчет: {out}")
+            try:
+                open_file(out)
+            except OSError as e:
+                self._js("say", f"Не удалось открыть отчет: {e}")
+        except Exception as e:
+            self._js("say", f"Ошибка: {e if isinstance(e, ValueError) else f'{type(e).__name__}: {e}'}")
+        finally:
+            self._js("done")
 
     def update(self):
         threading.Thread(target=self._do_update, daemon=True).start()
@@ -726,15 +774,21 @@ def main():
     if sys.argv[1] == "--swap-test":  # CI: собранный .exe подменяет себя и перезапускается, как при «Обновить»
         swap_after_exit(sys.argv[2], sys.executable, args=f'--version-file "{sys.argv[3]}"')
         os._exit(0)
-    ap = argparse.ArgumentParser(description="Сверка «Получено от плательщиков» с xlsx")
+    ap = argparse.ArgumentParser(description="Сверка «Получено от плательщиков» с xlsx и ежедневный отчет")
     ap.add_argument("--xlsx", required=True)
-    ap.add_argument("--pdf", required=True)
+    ap.add_argument("--pdf", help="PDF со ссылками на группы — для сверки")
+    ap.add_argument("--report-from", type=dt.date.fromisoformat, metavar="ГГГГ-ММ-ДД", help="отчет за день или с этого дня")
+    ap.add_argument("--report-to", type=dt.date.fromisoformat, metavar="ГГГГ-ММ-ДД", help="…по этот день")
     ap.add_argument("--out")
     ap.add_argument("--site", default=SITE, help=argparse.SUPPRESS)  # для проверки на локальной копии
     a = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):  # собранный .exe пишет в файл/pipe в cp1252 и падает на кириллице
         if stream is not None:
             stream.reconfigure(encoding="utf-8", errors="replace")
+    if a.report_from:
+        return print("Отчет:", make_report(a.xlsx, a.report_from, a.report_to, a.out))
+    if not a.pdf:
+        ap.error("нужен --pdf (сверка) или --report-from (отчет)")
     if webview2_missing():
         sys.exit(f"Нужен Microsoft Edge WebView2 Runtime: {WEBVIEW2_URL}")
     web, finished = login_window(a.pdf, a.site), threading.Event()
