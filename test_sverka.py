@@ -204,9 +204,18 @@ def main():
 def frozen(exe):
     """Собранное приложение в консольном режиме: открывает окно сайта, тестовый сайт входит сам, дальше сверка."""
     server, base, xlsx, pdf, out = setup()
-    r = subprocess.run([exe, "--xlsx", str(xlsx), "--pdf", str(pdf), "--out", str(out), "--site", base],
-                       capture_output=True, text=True, timeout=180)
-    assert r.returncode == 0 and out.exists(), (r.returncode, r.stdout[-2000:], r.stderr[-2000:], FakeHolliHop.log)
+    logs = out.with_suffix(".log")
+    with open(logs, "w") as f:  # не pipe: onefile-.exe держит его дочерним процессом, и ожидание вечное
+        p = subprocess.Popen([exe, "--xlsx", str(xlsx), "--pdf", str(pdf), "--out", str(out), "--site", base],
+                             stdout=f, stderr=subprocess.STDOUT)
+        try:
+            code = p.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], check=False)
+            p.kill()
+            code = "timeout"
+    assert code == 0 and out.exists(), (code, logs.read_text(errors="replace")[-3000:], FakeHolliHop.log)
     check_report(out)
     check_read_only()
     server.shutdown()

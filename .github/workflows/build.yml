@@ -10,6 +10,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     env:
       PYTHONUTF8: "1"
     steps:
@@ -21,9 +22,13 @@ jobs:
       - run: python test_sverka.py
       - name: Build Sverka.exe
         if: runner.os == 'Windows'
+        run: pyinstaller --onefile --windowed --name Sverka sverka.py
+      - name: Check Sverka.exe (console twin, so errors are visible)
+        if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --name Sverka sverka.py
-          python test_sverka.py --frozen dist/Sverka.exe
+          reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv
+          pyinstaller --onefile --console --name SverkaCheck sverka.py
+          python test_sverka.py --frozen dist/SverkaCheck.exe
       - name: Build Sverka.app
         if: runner.os == 'macOS'
         run: |

@@ -533,7 +533,25 @@ class Api:  # методы доступны странице приложени�
             self._js("done")
 
 
+WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+
+
+def webview2_missing():
+    """На Windows без WebView2 pywebview молча берёт движок IE, где окна не работают — лучше сказать сразу."""
+    if sys.platform != "win32":
+        return False
+    from webview.platforms import winforms  # тот же выбор движка, что сделает webview.start()
+    return winforms.renderer != "edgechromium"
+
+
 def gui():
+    if webview2_missing():
+        import ctypes
+        import webbrowser
+        ctypes.windll.user32.MessageBoxW(
+            0, "Для окна сайта нужен Microsoft Edge WebView2 Runtime. Сейчас откроется страница загрузки — "
+               "установите «Evergreen Bootstrapper» и запустите программу снова.", "Сверка", 0x30)
+        return webbrowser.open(WEBVIEW2_URL)
     api = Api()
     api._win = webview.create_window("Сверка ExpertOnline", html=APP_HTML, js_api=api, width=820, height=560)
     webview.start(private_mode=True)
@@ -548,6 +566,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--site", default=SITE, help=argparse.SUPPRESS)  # для проверки на локальной копии
     a = ap.parse_args()
+    if webview2_missing():
+        sys.exit(f"Нужен Microsoft Edge WebView2 Runtime: {WEBVIEW2_URL}")
     web, result = login_window(a.pdf, a.site), {}
 
     def job():
