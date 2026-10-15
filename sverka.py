@@ -566,23 +566,28 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--site", default=SITE, help=argparse.SUPPRESS)  # для проверки на локальной копии
     a = ap.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # собранный .exe пишет в файл/pipe в cp1252 и падает на кириллице
+        if stream is not None:
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if webview2_missing():
         sys.exit(f"Нужен Microsoft Edge WebView2 Runtime: {WEBVIEW2_URL}")
-    web, result = login_window(a.pdf, a.site), {}
+    web = login_window(a.pdf, a.site)
 
     def job():
+        code = 1
         try:
             out, rows = run(a.xlsx, a.pdf, web, a.out, site=a.site,
                             progress=lambda i, n, msg: print(f"[{i}/{n}] {msg}" if i else msg, flush=True))
             print(summary(rows), "\nОтчёт:", out, flush=True)
-            result["ok"] = True
+            code = 0
         except Exception as e:
             print("Ошибка:", e, file=sys.stderr, flush=True)
         finally:
             web.close()
+            # ponytail: выходим сразу — на Windows destroy() окна, которое ещё грузится, теряется и start() не вернётся
+            os._exit(code)
 
     webview.start(job, private_mode=True)
-    sys.exit(0 if result.get("ok") else 1)
 
 
 if __name__ == "__main__":
