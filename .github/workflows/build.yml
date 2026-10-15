@@ -21,11 +21,14 @@ jobs:
       - run: python test_sverka.py
       - name: Build Sverka.exe
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --windowed --name Sverka sverka.py
+        run: |
+          pyinstaller --onefile --windowed --name Sverka sverka.py
+          python test_sverka.py --frozen dist/Sverka.exe
       - name: Build Sverka.app
         if: runner.os == 'macOS'
         run: |
           pyinstaller --windowed --name Sverka sverka.py
+          python test_sverka.py --frozen dist/Sverka.app/Contents/MacOS/Sverka
           ditto -c -k --keepParent dist/Sverka.app dist/Sverka-macos.zip
       - uses: actions/upload-artifact@v4
         with:

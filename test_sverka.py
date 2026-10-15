@@ -1,11 +1,15 @@
 """Самопроверка без настоящего сайта: синтетические xlsx/PDF + локальный сервер, похожий на HolliHop.
 
-    python test_sverka.py
+    python test_sverka.py                  # ядро сверки и отчёт
+    python test_sverka.py --frozen <exe>   # собранное приложение целиком: окно сайта, вход, чтение страниц
 """
 import html
+import subprocess
+import sys
 import tempfile
 import threading
 import urllib.parse
+import urllib.request
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -77,6 +81,12 @@ def make_pdf(path, base):
     w.write(path)
 
 
+# Тестовый сайт входит сам вместо человека: форма с тестовым логином отправляется скриптом страницы.
+LOGIN_PAGE = ('<form method="post" action="{action}"><input name="LogLogin" value="{login}">'
+              '<input name="LogPassword" type="password" value="{password}"></form>'
+              "<script>document.forms[0].submit()</script>")
+
+
 class FakeHolliHop(BaseHTTPRequestHandler):
     log = []
 
@@ -95,16 +105,20 @@ class FakeHolliHop(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.log.append(("POST", self.path))
+        u = urllib.parse.urlsplit(self.path)
         form = urllib.parse.parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
-        if self.path == "/Account/LogOn" and form.get("LogLogin") == [LOGIN] and form.get("LogPassword") == [PASSWORD]:
-            return self._send(302, headers=[("Location", "/"), ("Set-Cookie", ".ASPXAUTH=ok; path=/; HttpOnly")])
-        self._send(200, "<form>login</form>")
+        if u.path == "/Account/LogOn" and form.get("LogLogin") == [LOGIN] and form.get("LogPassword") == [PASSWORD]:
+            back = urllib.parse.parse_qs(u.query).get("ReturnUrl", ["/"])[0]
+            return self._send(302, headers=[("Location", back), ("Set-Cookie", ".ASPXAUTH=ok; path=/; HttpOnly")])
+        self._send(200, "<p>Неверный логин или пароль</p>")
 
     def do_GET(self):
         self.log.append(("GET", self.path))
         path = urllib.parse.urlsplit(self.path).path
-        if path in ("/", "/Account/LogOn"):
-            return self._send(200, "<form>login</form>")
+        if path == "/Account/LogOn":
+            return self._send(200, LOGIN_PAGE.format(action=html.escape(self.path), login=LOGIN, password=PASSWORD))
+        if path in ("/", "/favicon.ico"):
+            return self._send(200, "<p>Главная</p>")
         if ".ASPXAUTH=ok" not in (self.headers.get("Cookie") or ""):
             return self._send(302, headers=[("Location", "/Account/LogOn?ReturnUrl=" + urllib.parse.quote(path))])
         parts = path.strip("/").split("/")
@@ -120,7 +134,7 @@ class FakeHolliHop(BaseHTTPRequestHandler):
                         f"<td><a href=\"/Payment/SearchLearnerPayments?LearnerId={gid}\">{received}</a></td></tr></table>")
 
 
-def main():
+def setup():
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeHolliHop)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
@@ -128,15 +142,36 @@ def main():
     xlsx, pdf, out = tmp / "t.xlsx", tmp / "t.pdf", tmp / "r.docx"
     make_xlsx(xlsx)
     make_pdf(pdf, base)
-
-    try:
-        sverka.run(xlsx, pdf, LOGIN, "wrong", out, site=base)
-        raise AssertionError("неверный пароль должен давать LoginError")
-    except sverka.LoginError:
-        pass
-
     FakeHolliHop.log.clear()
-    _, rows = sverka.run(xlsx, pdf, LOGIN, PASSWORD, out, site=base)
+    return server, base, xlsx, pdf, out
+
+
+def check_report(out):
+    doc = docx.Document(out)
+    text = "\n".join(c.text for t in doc.tables for row in t.rows for c in row.cells)
+    assert "РАСХОЖДЕНИЕ" in text and "75\u00a0000,00" in text and "-105,00" in text, text[:500]
+    paras = "\n".join(p.text for p in doc.paragraphs)
+    assert FOREIGN in paras and "«ИСТ спецкурсы», строка 3: в C вместо суммы «Стартер-пак»" in paras, paras
+
+
+def check_read_only():
+    """На сайте только GET страниц групп и входа; POST — только форма входа (её отправляет страница сайта)."""
+    log = FakeHolliHop.log
+    assert log, "к сайту не обращались"
+    assert {m for m, _ in log} <= {"GET", "POST"}, log
+    assert all(urllib.parse.urlsplit(p).path == "/Account/LogOn" for m, p in log if m == "POST"), log
+    assert all(urllib.parse.urlsplit(p).path in ("/", "/favicon.ico", "/Account/LogOn") or p.startswith("/Learner/")
+               for m, p in log if m == "GET"), log
+
+
+def main():
+    server, base, xlsx, pdf, out = setup()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())  # тестовый клиент вместо окна сайта
+    opener.open(base + "/Account/LogOn", urllib.parse.urlencode({"LogLogin": LOGIN, "LogPassword": PASSWORD}).encode())
+    fetch = lambda url: opener.open(base + sverka.group_path(url, base)).read().decode()
+
+    rows, links, skipped, problems = sverka.reconcile(xlsx, pdf, fetch, site=base)
+    sverka.write_report(out, rows, links, skipped, problems, xlsx, pdf)
     by_name = {g.name or g.url: r for r in rows for g in r.groups}
     status = {name: r.status for name, r in by_name.items()}
     assert status["26/27 сентябрь ГК ОБЩ БАЗА"] == "ok"
@@ -152,27 +187,31 @@ def main():
     assert (sp.status, sp.diff, sp.cells) == ("diff", Decimal("500.00"), ["«ОБЩ спецкурсы»!C3"])
     assert status[f"{base}/Learner/Group/{BROKEN}"] == "error"
     assert sum(len(r.groups) for r in rows) == len(PAGES) + 1  # + битая; повтор ссылки — один раз
-
-    # только чтение: GET страниц групп и формы входа, POST — только сам вход
-    assert {m for m, _ in FakeHolliHop.log} <= {"GET", "POST"}
-    assert [p for m, p in FakeHolliHop.log if m == "POST"] == ["/Account/LogOn"]
-    assert all(p in ("/", "/Account/LogOn") or p.startswith("/Learner/") for m, p in FakeHolliHop.log if m == "GET")
-    try:
-        sverka.Site(base).get(base + "/Payment/Delete/1")
-        raise AssertionError("Site.get должен отказываться от не-групповых адресов")
-    except ValueError:
-        pass
-
-    doc = docx.Document(out)
-    text = "\n".join(c.text for t in doc.tables for row in t.rows for c in row.cells)
-    assert "РАСХОЖДЕНИЕ" in text and "75\u00a0000,00" in text and "-105,00" in text, text[:500]
-    paras = "\n".join(p.text for p in doc.paragraphs)
-    assert FOREIGN in paras and "«ИСТ спецкурсы», строка 3: в C вместо суммы «Стартер-пак»" in paras, paras
-    assert sverka.parse_money("−1 234,50 руб.") == Decimal("-1234.50")
+    check_read_only()
+    for bad in (base + "/Payment/Delete/1", FOREIGN, "https://expertonline.t8s.ru/Learner/Group/1"):
+        try:
+            sverka.group_path(bad, base)
+            raise AssertionError(f"group_path должен отказать: {bad}")
+        except ValueError:
+            pass
+    check_report(out)
+    assert sverka.parse_money("−1\u00a0234,50 руб.") == Decimal("-1234.50")
     assert sverka.parse_group_name("26/27 октябрьГК ОБЩ ПРО + ВГ") == ("ОБЩ", "Октябрь", "про+вг")
     server.shutdown()
     print("ok:", sverka.summary(rows))
 
 
+def frozen(exe):
+    """Собранное приложение в консольном режиме: открывает окно сайта, тестовый сайт входит сам, дальше сверка."""
+    server, base, xlsx, pdf, out = setup()
+    r = subprocess.run([exe, "--xlsx", str(xlsx), "--pdf", str(pdf), "--out", str(out), "--site", base],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0 and out.exists(), (r.returncode, r.stdout[-2000:], r.stderr[-2000:], FakeHolliHop.log)
+    check_report(out)
+    check_read_only()
+    server.shutdown()
+    print("ok frozen:", exe, "| запросов к сайту:", len(FakeHolliHop.log))
+
+
 if __name__ == "__main__":
-    main()
+    frozen(sys.argv[2]) if sys.argv[1:2] == ["--frozen"] else main()

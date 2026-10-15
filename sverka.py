@@ -1,26 +1,22 @@
 """Сверка «Получено от плательщиков» (HolliHop, expertonline.t8s.ru) с таблицей учеников (xlsx).
 
 Вход: xlsx с листами «<ПРЕДМЕТ> ГК» и «<ПРЕДМЕТ> спецкурсы» + PDF со ссылками на группы.
-Выход: docx с расхождениями. На сайте только входит и читает страницы групп (GET), ничего не меняет.
+Выход: docx с расхождениями. Вход на сайт человек делает сам в окне приложения (обычная страница входа),
+дальше программа только читает страницы групп из PDF (GET) этой сессией и ничего на сайте не меняет.
 
-Без аргументов открывается окно. Консоль:
+Без аргументов открывается окно. Консоль (окно сайта для входа всё равно откроется):
     python sverka.py --xlsx table.xlsx --pdf courses.pdf [--out report.docx]
-    логин/пароль — из SVERKA_LOGIN / SVERKA_PASSWORD или спросит в консоли.
 """
 import argparse
 import datetime as dt
-import getpass
 import html
-import http.cookiejar
+import json
 import os
-import queue
 import re
-import ssl
 import subprocess
 import sys
 import threading
 import urllib.parse
-import urllib.request
 import warnings
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -29,6 +25,7 @@ from pathlib import Path
 import docx
 import openpyxl
 import pypdf
+import webview
 from docx.enum.section import WD_ORIENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -45,7 +42,6 @@ ALIASES = {"с-п": "стартер-пак"}  # сокращение в назв
 LATIN_LOOKALIKES = str.maketrans("aceopxykmthb", "асеорхукмтнв")
 SITE = "https://expertonline.t8s.ru"  # пароль уходит только сюда; ссылки PDF на другие адреса пропускаются
 GROUP_PATH = re.compile(r"/Learner/(?:Group/)?(\d+)/?")
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 ZERO = Decimal(0)
 
 
@@ -158,45 +154,67 @@ def _dec(v):
 
 # ---------- сайт (только чтение) ----------
 
-def _tls():
-    # Собранное .app ищет сертификаты там, где они лежали у Python на машине сборки; на macOS берём системные.
-    if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem"):
-        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
-    return ssl.create_default_context()
+def group_path(url, site=SITE):
+    """Путь страницы группы на нашем сайте; всё остальное читать отказываемся."""
+    u, o = urllib.parse.urlsplit(url), urllib.parse.urlsplit(site)
+    if (u.scheme, u.netloc.casefold()) != (o.scheme, o.netloc.casefold()) or not GROUP_PATH.fullmatch(u.path):
+        raise ValueError(f"не страница группы {o.netloc}: {url}")
+    return u.path
 
 
-class Site:
-    def __init__(self, base):
-        self.base = base.rstrip("/")
-        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_tls()),
-                                                  urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        self.opener.addheaders = [("User-Agent", UA)]
+class WebSession:
+    """Окно сайта: человек сам входит на обычной странице входа, дальше читаем страницы групп его сессией."""
 
-    def _open(self, path, data=None):
-        with self.opener.open(self.base + path, data=data, timeout=60) as r:
-            return r.geturl(), r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+    def __init__(self, site, return_path):
+        self.site = site.rstrip("/")
+        self.closed = threading.Event()
+        self.win = webview.create_window(
+            "Вход на сайт — войдите своим логином и паролем",
+            f"{self.site}/Account/LogOn?ReturnUrl={urllib.parse.quote(return_path)}", width=1000, height=760)
+        self.win.events.closed += self.closed.set
 
-    def login(self, login, password):
-        self._open("/Account/LogOn")
-        form = urllib.parse.urlencode({"LogLogin": login, "LogPassword": password, "LogRememberMe": "false"})
-        url, _ = self._open("/Account/LogOn", form.encode())
-        if "/account/logon" in url.casefold():
-            raise LoginError("Не удалось войти на сайт: проверьте логин и пароль.")
+    def wait_login(self):
+        host = urllib.parse.urlsplit(self.site).netloc.casefold()
+        while not self.closed.wait(0.5):
+            u = urllib.parse.urlsplit(self.win.get_current_url() or "")
+            if u.netloc.casefold() == host and not u.path.casefold().startswith("/account/"):
+                try:
+                    if self.win.evaluate_js("document.readyState") == "complete":
+                        return
+                except Exception:  # страница ещё грузится
+                    pass
+        raise LoginError("Окно сайта закрыто — сверка отменена.")
 
     def get(self, url):
-        path = urllib.parse.urlsplit(url).path
-        if not GROUP_PATH.fullmatch(path):  # читаем только страницы групп
-            raise ValueError(f"не страница группы: {url}")
-        for attempt in (1, 2):
-            try:
-                final, text = self._open(path)
-                break
-            except OSError:
-                if attempt == 2:
-                    raise
-        if "/account/logon" in final.casefold():
+        path = group_path(url, self.site)
+        if self.closed.is_set():
+            raise LoginError("Окно сайта закрыто — сверка прервана.")
+        done, box = threading.Event(), {}
+        self.win.evaluate_js(  # обычный GET из окна сайта, с его же сессией
+            f"fetch({json.dumps(path)}, {{credentials: 'same-origin', cache: 'no-store'}})"
+            ".then(r => r.text().then(t => ({url: r.url, status: r.status, text: t})))",
+            callback=lambda r: (box.setdefault("r", r), done.set()))
+        if not done.wait(120):
+            raise TimeoutError("сайт не ответил за 2 минуты")
+        r = box["r"]
+        if not isinstance(r, dict) or "text" not in r:
+            raise ValueError(f"страница не загрузилась: {r}")
+        if "/account/logon" in r["url"].casefold():
             raise LoginError("Сайт попросил войти заново (сессия закончилась).")
-        return text
+        if r["status"] != 200:
+            raise ValueError(f"HTTP {r['status']}")
+        return r["text"]
+
+    def close(self):
+        if not self.closed.is_set():
+            self.win.destroy()
+
+
+def login_window(pdf, site=SITE):
+    links, _ = pdf_links(pdf, site)
+    if not links:
+        raise ValueError(f"В PDF нет ссылок на группы {site}/Learner/Group/<номер>.")
+    return WebSession(site, group_path(links[0], site))
 
 
 def parse_group_page(text):
@@ -421,13 +439,10 @@ def write_report(path, rows, links, skipped, problems, xlsx, pdf):
     doc.save(path)
 
 
-def run(xlsx, pdf, login, password, out=None, progress=lambda i, n, msg: None, site=SITE):
-    links, _ = pdf_links(pdf, site)
-    if not links:
-        raise ValueError(f"В PDF нет ссылок на группы {site}/Learner/Group/<номер>.")
-    web = Site(site)
-    progress(0, len(links), f"Вход на {urllib.parse.urlsplit(site).netloc}…")
-    web.login(login, password)
+def run(xlsx, pdf, web, out=None, progress=lambda i, n, msg: None, site=SITE):
+    progress(0, 0, "Войдите на сайт в открывшемся окне — логин и пароль вводите сами.")
+    web.wait_login()
+    progress(0, 0, "Вход выполнен, читаю страницы групп…")
     rows, links, skipped, problems = reconcile(xlsx, pdf, web.get, progress, site)
     out = out or str(Path(xlsx).with_name(f"Расхождения {dt.datetime.now():%Y-%m-%d %H-%M}.docx"))
     write_report(out, rows, links, skipped, problems, xlsx, pdf)
@@ -450,91 +465,78 @@ def open_file(path):
 
 # ---------- окно ----------
 
-def gui():
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+APP_HTML = """<!doctype html><meta charset="utf-8"><style>
+body { font: 14px -apple-system, "Segoe UI", sans-serif; margin: 16px; background: #f4f4f4; color: #222 }
+.row { display: flex; gap: 10px; align-items: center; margin: 8px 0 }
+.row span { color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+button { padding: 6px 14px; font: inherit }
+progress { width: 100%; margin: 10px 0 }
+pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; padding: 8px; margin: 0; white-space: pre-wrap }
+</style>
+<div class="row"><button onclick="pick('xlsx')">Таблица xlsx…</button><span id="xlsx">не выбрана</span></div>
+<div class="row"><button onclick="pick('pdf')">PDF со ссылками…</button><span id="pdf">не выбран</span></div>
+<div class="row"><button id="go" onclick="go()">Сверить</button>
+  <span>Откроется окно сайта — войдите в нём сами, дальше программа только читает страницы групп.</span></div>
+<progress id="bar" value="0" max="1"></progress>
+<pre id="log"></pre>
+<script>
+const files = {};
+async function pick(kind) {
+  const path = await pywebview.api.pick(kind);
+  if (path) { files[kind] = path; document.getElementById(kind).textContent = path; }
+}
+function go() {
+  if (!files.xlsx || !files.pdf) { say("Выберите таблицу xlsx и PDF."); return; }
+  document.getElementById("go").disabled = true;
+  document.getElementById("log").textContent = "";
+  pywebview.api.start(files.xlsx, files.pdf);
+}
+function say(msg) { const l = document.getElementById("log"); l.textContent += msg + "\\n"; l.scrollTop = l.scrollHeight; }
+function progress(i, n) { const b = document.getElementById("bar"); b.max = Math.max(n, 1); b.value = i; }
+function done() { document.getElementById("go").disabled = false; }
+</script>"""
 
-    root = tk.Tk()
-    root.title("Сверка ExpertOnline")
-    f = ttk.Frame(root, padding=12)
-    f.grid(sticky="nsew")
-    root.columnconfigure(0, weight=1)
-    root.rowconfigure(0, weight=1)
-    f.columnconfigure(1, weight=1)
-    xlsx, pdf, login, password = (tk.StringVar() for _ in range(4))
 
-    def pick(var, kind, ext):
-        p = filedialog.askopenfilename(filetypes=[(kind, ext), ("Все файлы", "*.*")])
-        if p:
-            var.set(p)
+class Api:  # методы доступны странице приложения как pywebview.api.*
+    _win = None
 
-    for r, (text, var, kind, ext) in enumerate([("Таблица xlsx", xlsx, "Excel", "*.xlsx"), ("PDF со ссылками", pdf, "PDF", "*.pdf")]):
-        ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", pady=3)
-        ttk.Entry(f, textvariable=var, width=60).grid(row=r, column=1, sticky="ew", padx=6)
-        ttk.Button(f, text="Выбрать…", command=lambda v=var, k=kind, e=ext: pick(v, k, e)).grid(row=r, column=2)
-    ttk.Label(f, text="Логин").grid(row=2, column=0, sticky="w", pady=3)
-    ttk.Entry(f, textvariable=login).grid(row=2, column=1, sticky="ew", padx=6)
-    ttk.Label(f, text="Пароль").grid(row=3, column=0, sticky="w", pady=3)
-    ttk.Entry(f, textvariable=password, show="•").grid(row=3, column=1, sticky="ew", padx=6)
-    btn = ttk.Button(f, text="Сверить")
-    btn.grid(row=4, column=1, sticky="w", padx=6, pady=8)
-    bar = ttk.Progressbar(f, mode="determinate")
-    bar.grid(row=5, column=0, columnspan=3, sticky="ew")
-    log = tk.Text(f, height=16, width=90, state="disabled", wrap="word")
-    log.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-    f.rowconfigure(6, weight=1)
-    events = queue.Queue()
+    def pick(self, kind):
+        types = ("Excel (*.xlsx)",) if kind == "xlsx" else ("PDF (*.pdf)",)
+        paths = self._win.create_file_dialog(webview.FileDialog.OPEN, file_types=types)
+        return paths[0] if paths else None
 
-    def say(msg):
-        log.configure(state="normal")
-        log.insert("end", msg + "\n")
-        log.see("end")
-        log.configure(state="disabled")
+    def start(self, xlsx, pdf):
+        threading.Thread(target=self._work, args=(xlsx, pdf), daemon=True).start()
 
-    def work(args):
+    def _js(self, fn, *args):
+        self._win.evaluate_js(f"{fn}({', '.join(json.dumps(a, ensure_ascii=False) for a in args)})")
+
+    def _progress(self, i, n, msg):
+        self._js("progress", i, n)
+        self._js("say", f"[{i}/{n}] {msg}" if i else msg)
+
+    def _work(self, xlsx, pdf):
+        web = None
         try:
-            out, rows = run(*args, progress=lambda i, n, msg: events.put(("p", i, n, msg)))
-            events.put(("done", out, summary(rows)))
+            web = login_window(pdf)
+            out, rows = run(xlsx, pdf, web, progress=self._progress)
+            self._js("say", f"\n{summary(rows)}\nОтчёт: {out}")
+            try:
+                open_file(out)
+            except OSError as e:
+                self._js("say", f"Не удалось открыть отчёт: {e}")
         except Exception as e:
-            events.put(("err", f"{e}" if isinstance(e, (LoginError, ValueError)) else f"{type(e).__name__}: {e}"))
+            self._js("say", f"\nОшибка: {e if isinstance(e, (LoginError, ValueError)) else f'{type(e).__name__}: {e}'}")
+        finally:
+            if web:
+                web.close()
+            self._js("done")
 
-    def poll():
-        try:
-            while True:
-                ev = events.get_nowait()
-                if ev[0] == "p":
-                    bar.configure(maximum=max(ev[2], 1), value=ev[1])
-                    say(f"[{ev[1]}/{ev[2]}] {ev[3]}" if ev[1] else ev[3])
-                elif ev[0] == "done":
-                    btn.state(["!disabled"])
-                    say(f"\n{ev[2]}\nОтчёт: {ev[1]}")
-                    try:
-                        open_file(ev[1])
-                    except OSError as e:
-                        say(f"Не удалось открыть отчёт: {e}")
-                else:
-                    btn.state(["!disabled"])
-                    say(f"\nОшибка: {ev[1]}")
-                    messagebox.showerror("Сверка", ev[1])
-        except queue.Empty:
-            pass
-        root.after(100, poll)
 
-    def start():
-        paths = [xlsx.get().strip(), pdf.get().strip()]
-        if not all(Path(p).is_file() for p in paths):
-            return messagebox.showwarning("Сверка", "Выберите файлы xlsx и PDF.")
-        if not login.get().strip() or not password.get():
-            return messagebox.showwarning("Сверка", "Введите логин и пароль от сайта.")
-        btn.state(["disabled"])
-        log.configure(state="normal")
-        log.delete("1.0", "end")
-        log.configure(state="disabled")
-        threading.Thread(target=work, args=((*paths, login.get().strip(), password.get()),), daemon=True).start()
-
-    btn.configure(command=start)
-    root.after(100, poll)
-    root.mainloop()
+def gui():
+    api = Api()
+    api._win = webview.create_window("Сверка ExpertOnline", html=APP_HTML, js_api=api, width=820, height=560)
+    webview.start(private_mode=True)
 
 
 def main():
@@ -546,12 +548,21 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--site", default=SITE, help=argparse.SUPPRESS)  # для проверки на локальной копии
     a = ap.parse_args()
-    login = os.environ.get("SVERKA_LOGIN") or input("Логин: ")
-    password = os.environ.get("SVERKA_PASSWORD") or getpass.getpass("Пароль: ")
-    out, rows = run(a.xlsx, a.pdf, login, password, a.out,
-                    progress=lambda i, n, msg: print(f"[{i}/{n}] {msg}" if i else msg, flush=True), site=a.site)
-    print(summary(rows))
-    print("Отчёт:", out)
+    web, result = login_window(a.pdf, a.site), {}
+
+    def job():
+        try:
+            out, rows = run(a.xlsx, a.pdf, web, a.out, site=a.site,
+                            progress=lambda i, n, msg: print(f"[{i}/{n}] {msg}" if i else msg, flush=True))
+            print(summary(rows), "\nОтчёт:", out, flush=True)
+            result["ok"] = True
+        except Exception as e:
+            print("Ошибка:", e, file=sys.stderr, flush=True)
+        finally:
+            web.close()
+
+    webview.start(job, private_mode=True)
+    sys.exit(0 if result.get("ok") else 1)
 
 
 if __name__ == "__main__":
