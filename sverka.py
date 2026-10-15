@@ -2,7 +2,7 @@
 
 Вход: xlsx с листами «<ПРЕДМЕТ> ГК» и «<ПРЕДМЕТ> спецкурсы» + PDF со ссылками на группы.
 Выход: docx с расхождениями. Вход на сайт человек делает сам в окне приложения (обычная страница входа),
-дальше программа только читает страницы групп из PDF (GET) этой сессией и ничего на сайте не меняет.
+дальше окно по очереди открывает страницы групп из PDF, программа читает их и ничего на сайте не меняет.
 
 Без аргументов открывается окно. Консоль (окно сайта для входа всё равно откроется):
     python sverka.py --xlsx table.xlsx --pdf courses.pdf [--out report.docx]
@@ -162,48 +162,78 @@ def group_path(url, site=SITE):
     return u.path
 
 
+READ_PAGE_JS = """(() => {
+  const cap = document.querySelector("x-caption");
+  const td = Array.from(document.querySelectorAll("td")).find(t => t.textContent.trim() === "Получено от плательщиков:");
+  return {path: location.pathname,
+          html: "<title>" + document.title + "</title>" + (cap ? cap.outerHTML : "") + (td ? td.parentElement.outerHTML : "")};
+})()"""
+CLOSED = "Окно сайта закрыто — сверка прервана."
+
+
 class WebSession:
     """Окно сайта: человек сам входит на обычной странице входа, дальше читаем страницы групп его сессией."""
 
-    def __init__(self, site, return_path):
+    def __init__(self, site):
         self.site = site.rstrip("/")
         self.closed = threading.Event()
-        self.win = webview.create_window(
-            "Вход на сайт — войдите своим логином и паролем",
-            f"{self.site}/Account/LogOn?ReturnUrl={urllib.parse.quote(return_path)}", width=1000, height=760)
+        # без ReturnUrl: после входа сайт уходит на свою главную, и первая группа — всегда новый адрес
+        self.win = webview.create_window("Вход на сайт — войдите своим логином и паролем",
+                                         f"{self.site}/Account/LogOn", width=1000, height=760)
         self.win.events.closed += self.closed.set
 
     def wait_login(self):
         host = urllib.parse.urlsplit(self.site).netloc.casefold()
         while not self.closed.wait(0.5):
-            u = urllib.parse.urlsplit(self.win.get_current_url() or "")
-            if u.netloc.casefold() == host and not u.path.casefold().startswith("/account/"):
-                try:
-                    if self.win.evaluate_js("document.readyState") == "complete":
-                        return
-                except Exception:  # страница ещё грузится
-                    pass
+            try:  # страница входа может грузиться долго — ждём, пока человек не войдёт или не закроет окно
+                u = urllib.parse.urlsplit(self.win.get_current_url() or "")
+                if u.netloc.casefold() == host and not u.path.casefold().startswith("/account/") \
+                        and self.win.evaluate_js("document.readyState") == "complete":
+                    return
+            except Exception:
+                pass
         raise LoginError("Окно сайта закрыто — сверка отменена.")
 
+    def _url(self):
+        try:
+            return self.win.get_current_url() or ""
+        except Exception:
+            return ""
+
+    def _open(self, path, again):
+        if again and urllib.parse.urlsplit(self._url()).path.rstrip("/") == path.rstrip("/"):
+            # повтор: WebView2 молча игнорирует load_url на уже открытую страницу — пусть перезагрузится сама
+            self.win.evaluate_js("setTimeout(() => location.reload(), 50)")
+            self.win.events.loaded.clear()
+        else:
+            self.win.load_url(self.site + path)
+        for _ in range(240):  # до 2 минут, но сразу выходим, если окно закрыли
+            if self.win.events.loaded.wait(0.5):
+                return
+            if self.closed.is_set():
+                raise LoginError(CLOSED)
+        raise TimeoutError("страница не загрузилась за 2 минуты")
+
     def get(self, url):
-        path = group_path(url, self.site)
-        if self.closed.is_set():
-            raise LoginError("Окно сайта закрыто — сверка прервана.")
-        done, box = threading.Event(), {}
-        self.win.evaluate_js(  # обычный GET из окна сайта, с его же сессией
-            f"fetch({json.dumps(path)}, {{credentials: 'same-origin', cache: 'no-store'}})"
-            ".then(r => r.text().then(t => ({url: r.url, status: r.status, text: t})))",
-            callback=lambda r: (box.setdefault("r", r), done.set()))
-        if not done.wait(120):
-            raise TimeoutError("сайт не ответил за 2 минуты")
-        r = box["r"]
-        if not isinstance(r, dict) or "text" not in r:
-            raise ValueError(f"страница не загрузилась: {r}")
-        if "/account/logon" in r["url"].casefold():
-            raise LoginError("Сайт попросил войти заново (сессия закончилась).")
-        if r["status"] != 200:
-            raise ValueError(f"HTTP {r['status']}")
-        return r["text"]
+        """Окно само открывает страницу группы (как клик по ссылке), отдаём заголовок и строку статистики."""
+        path, err = group_path(url, self.site), None
+        want = GROUP_PATH.fullmatch(path)[1]
+        for attempt in range(2):
+            if self.closed.is_set():
+                raise LoginError(CLOSED)
+            self._open(path, again=attempt > 0)
+            if "/account/logon" in self._url().casefold():
+                raise LoginError("Сайт попросил войти заново (сессия закончилась).")
+            try:
+                r = self.win.evaluate_js(READ_PAGE_JS)
+            except Exception as e:  # страница успела перезагрузиться сама — пробуем ещё раз
+                err = e
+                continue
+            m = GROUP_PATH.fullmatch(r.get("path", "")) if isinstance(r, dict) else None
+            if m and m[1] == want:  # прочитали именно ту группу, которую открывали
+                return r["html"]
+            err = f"открылась не та страница: {r.get('path') if isinstance(r, dict) else r}"
+        raise ValueError(f"страница не прочиталась: {err}")
 
     def close(self):
         if not self.closed.is_set():
@@ -214,7 +244,7 @@ def login_window(pdf, site=SITE):
     links, _ = pdf_links(pdf, site)
     if not links:
         raise ValueError(f"В PDF нет ссылок на группы {site}/Learner/Group/<номер>.")
-    return WebSession(site, group_path(links[0], site))
+    return WebSession(site)
 
 
 def parse_group_page(text):
@@ -571,7 +601,15 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
     if webview2_missing():
         sys.exit(f"Нужен Microsoft Edge WebView2 Runtime: {WEBVIEW2_URL}")
-    web = login_window(a.pdf, a.site)
+    web, finished = login_window(a.pdf, a.site), threading.Event()
+
+    def on_close():  # окно закрыли, Ctrl+C или Cmd+Q посреди сверки — не висим и не выходим «успешно»
+        if not finished.is_set():
+            print("Ошибка:", CLOSED, file=sys.stderr, flush=True)
+            os._exit(1)
+
+    web.win.events.closing += on_close
+    web.win.events.closed += on_close
 
     def job():
         code = 1
@@ -583,6 +621,7 @@ def main():
         except Exception as e:
             print("Ошибка:", e, file=sys.stderr, flush=True)
         finally:
+            finished.set()
             web.close()
             # ponytail: выходим сразу — на Windows destroy() окна, которое ещё грузится, теряется и start() не вернётся
             os._exit(code)
