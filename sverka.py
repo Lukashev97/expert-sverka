@@ -566,7 +566,9 @@ del "%~f0"
 def swap_after_exit(new, exe, args=""):
     script = Path(tempfile.gettempdir()) / f"sverka-update-{os.getpid()}.cmd"
     script.write_text(SWAP_CMD.replace("\n", "\r\n"), encoding="ascii")
-    env = dict(os.environ, SVERKA_NEW=str(new), SVERKA_EXE=str(exe), SVERKA_ARGS=args)
+    # PYINSTALLER_RESET_ENVIRONMENT: иначе новый .exe примет себя за дочерний процесс старого и будет искать
+    # Python в его временной папке, которой уже нет («Failed to load Python DLL»)
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1", SVERKA_NEW=str(new), SVERKA_EXE=str(exe), SVERKA_ARGS=args)
     subprocess.Popen(["cmd", "/c", str(script)], env=env, cwd=str(Path(exe).parent),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=subprocess.CREATE_NO_WINDOW)
@@ -719,6 +721,11 @@ def gui():
 def main():
     if len(sys.argv) == 1:
         return gui()
+    if sys.argv[1] == "--version-file":  # номер сборки в файл — им CI проверяет перезапуск после обновления
+        return Path(sys.argv[2]).write_text(str(BUILD))
+    if sys.argv[1] == "--swap-test":  # CI: собранный .exe подменяет себя и перезапускается, как при «Обновить»
+        swap_after_exit(sys.argv[2], sys.executable, args=f'--version-file "{sys.argv[3]}"')
+        os._exit(0)
     ap = argparse.ArgumentParser(description="Сверка «Получено от плательщиков» с xlsx")
     ap.add_argument("--xlsx", required=True)
     ap.add_argument("--pdf", required=True)

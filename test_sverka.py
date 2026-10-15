@@ -3,6 +3,7 @@
     python test_sverka.py                  # ядро сверки и отчёт
     python test_sverka.py --frozen <exe>   # собранное приложение целиком: окно сайта, вход, чтение страниц
     python test_sverka.py --swap           # Windows: подмена запущенного .exe при обновлении
+    python test_sverka.py --swap-frozen <Sverka.exe>  # Windows: собранный .exe подменяет себя и реально перезапускается
 """
 import hashlib
 import html
@@ -247,6 +248,21 @@ def swap():
     print("ok swap:", d)
 
 
+def swap_frozen(built):
+    """Собранный onefile .exe подменяет себя копией и перезапускается — ловит «Failed to load Python DLL»."""
+    d = Path(tempfile.mkdtemp())
+    exe, new, marker = d / "Sverka.exe", d / "Sverka.exe.new", d / "build.txt"
+    shutil.copy(built, exe)
+    shutil.copy(built, new)
+    subprocess.run([str(exe), "--swap-test", str(new), str(marker)], timeout=120)
+    for _ in range(90):
+        if marker.exists():
+            break
+        time.sleep(1)
+    assert marker.exists() and not new.exists(), ("новая версия не запустилась после подмены", list(d.iterdir()))
+    print("ok swap-frozen: перезапустилась сборка", marker.read_text())
+
+
 def frozen(exe):
     """Собранное приложение в консольном режиме: открывает окно сайта, тестовый сайт входит сам, дальше сверка."""
     server, base, xlsx, pdf, out = setup()
@@ -273,5 +289,7 @@ if __name__ == "__main__":
         frozen(sys.argv[2])
     elif sys.argv[1:2] == ["--swap"]:
         swap()
+    elif sys.argv[1:2] == ["--swap-frozen"]:
+        swap_frozen(sys.argv[2])
     else:
         main()
