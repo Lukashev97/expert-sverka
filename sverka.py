@@ -9,6 +9,7 @@
 """
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import html
 import json
@@ -218,7 +219,8 @@ PAYMENTS = "/Payment/SearchLearnerPayments"
 # Список оплат группы. В строках есть кнопки «изменить»/«удалить» — их не трогаем, читаем только текст таблицы.
 READ_PAYMENTS_JS = """(() => {
   const t = Array.from(document.querySelectorAll("table")).find(t => t.querySelector("th") && t.textContent.includes("Плательщик"));
-  const cells = tr => Array.from(tr.children).map(c => c.textContent.replace(/\\s+/g, " ").trim());
+  const text = n => n.textContent.replace(/\\s+/g, " ").trim();  // по узлам: «Кузьмин И. Н.» и «заказчик: …» не слипаются
+  const cells = tr => Array.from(tr.children).map(c => Array.from(c.childNodes).map(text).filter(Boolean).join(" "));
   const pages = Array.from(document.querySelectorAll("a.page-link"))
     .map(a => +(((a.getAttribute("href") || "").match(/[?&]Page=(\\d+)/) || [0, 0])[1]));
   return {path: location.pathname, search: location.search,
@@ -343,7 +345,7 @@ def payment_rows(head, rows):
     ip, ia, ist = idx.get("Плательщик"), idx.get("Размер оплаты"), idx.get("Статус")
     if ip is None or ia is None:
         raise ValueError("на странице оплат нет колонок «Плательщик» / «Размер оплаты»")
-    return [(cells[ip], parse_money(cells[ia])) for cells in rows
+    return [(re.sub(r"\s*заказчик:\s*(.+)", r" (заказчик: \1)", cells[ip]), parse_money(cells[ia])) for cells in rows
             if len(cells) > max(ip, ia) and not (ist is not None and len(cells) > ist and "не оплачен" in cells[ist].casefold())]
 
 
@@ -391,6 +393,7 @@ class Row:  # одна строка отчёта: группа (или неск�
     hits: list = field(default_factory=list)  # ячейки xlsx (Entry), с которыми сравнивали
     students: list = field(default_factory=list)  # [(ученик на сайте, ученик в xlsx, сайт, xlsx)] — только расходящиеся
     students_note: str = ""
+    typos: list = field(default_factory=list)  # [(на сайте, в xlsx)] — суммы равны, ФИО отличается опечаткой
 
     @property
     def site(self):
@@ -463,11 +466,12 @@ def student_diff(row, payments, people=None, skip_sheets=()):
         rows, footer = payments(g.url)
         site += rows
         footers.append(footer)
+    if any(e.students is None for e in row.hits):  # иначе все плательщики сайта выглядели бы расхождением
+        row.students_note = "в xlsx сумма не формулой SUMIF — по ученикам не сравнить"
+        return
     xl = [(name, amount) for e in row.hits for name, amount, _ in (e.students or [])]
     counted = {(e.sheet, r) for e in row.hits for _, _, r in (e.students or [])}
     notes = []
-    if any(e.students is None for e in row.hits):
-        notes.append("часть суммы xlsx — не формула SUMIF, учеников по ней не видно")
     paid = sum((a for _, a in site), ZERO)
     if row.site is not None and abs(paid - row.site) >= Decimal("0.01"):
         notes.append(f"на сайте в списке оплат {fmt(paid)}, а «Получено от плательщиков» {fmt(row.site)}")
@@ -491,8 +495,16 @@ def student_diff(row, payments, people=None, skip_sheets=()):
                  if (sh, r) not in counted and sh not in skip_sheets and any(same_person(full, n) for n in names)]
         return ", ".join(spots[:6]) + (" …" if len(spots) > 6 else "")
 
+    differ = {k: v for k, v in by.items() if abs(v[2] - v[3]) >= Decimal("0.01")}
+    # «только на сайте» + «только в xlsx» на ту же сумму и с почти той же фамилией — опечатка в ФИО, а не деньги
+    for ks in [k for k, v in differ.items() if not v[1]]:
+        kx = next((k for k, v in differ.items() if not v[0] and k[1] == ks[1] and v[3] == differ[ks][2]
+                   and difflib.SequenceMatcher(None, k[0], ks[0]).ratio() >= 0.8), None)
+        if kx:
+            row.typos.append((", ".join(sorted(differ[ks][0])), ", ".join(sorted(differ[kx][1]))))
+            del differ[ks], differ[kx]
     row.students = sorted((", ".join(sorted(s)) or "—", ", ".join(sorted(x)) or "—", a, b, elsewhere(k, s | x))
-                          for k, (s, x, a, b) in by.items() if abs(a - b) >= Decimal("0.01"))
+                          for k, (s, x, a, b) in differ.items())
     row.students_note = "; ".join(notes + [f for f in footers if f])
 
 
@@ -514,23 +526,27 @@ def reconcile(xlsx, pdf, fetch, progress=lambda i, n, msg: None, site=SITE, paym
     if payments:  # по группам с расхождением — кто из учеников его даёт
         # листы со сводкой, ни одна ячейка которой не совпала с сайтом, — прошлый год: в «где ещё» не смотрим
         skip = {e.sheet for e in entries} - {e.sheet for r in rows for e in r.hits}
-        bad = [r for r in rows if r.status in PROBLEM]
-        for i, row in enumerate(bad, 1):
-            progress(i, len(bad), f"Оплаты по ученикам: {', '.join(g.name for g in row.groups)}")
+        # все группы с деньгами: сумма может совпасть, а ошибки двух учеников — погасить друг друга
+        todo = [r for r in rows if r.status in PROBLEM or (r.status == "ok" and (r.site or r.xlsx))]
+        for i, row in enumerate(todo, 1):
+            progress(i, len(todo), f"Оплаты по ученикам: {', '.join(g.name for g in row.groups)}")
             try:
                 student_diff(row, payments, people, skip)
             except LoginError:
                 raise
             except Exception as e:
                 row.students_note = f"не удалось разобрать по ученикам: {type(e).__name__}: {e}"
+            if row.status == "ok" and row.students:
+                row.status = "students"
     return rows, links, skipped, problems
 
 
 # ---------- отчёт ----------
 
 STATUS = {"ok": "совпадает", "diff": "РАСХОЖДЕНИЕ", "missing": "РАСХОЖДЕНИЕ: нет в xlsx",
-          "empty": "нет в xlsx, на сайте 0", "ambiguous": "неоднозначно", "error": "ошибка загрузки"}
-PROBLEM = ("diff", "missing")
+          "students": "РАСХОЖДЕНИЕ по ученикам", "empty": "нет в xlsx, на сайте 0", "ambiguous": "неоднозначно",
+          "error": "ошибка загрузки"}
+PROBLEM = ("diff", "missing", "students")
 RED = RGBColor(0xC0, 0x00, 0x00)
 
 
@@ -606,15 +622,22 @@ def write_report(path, rows, links, skipped, problems, xlsx, pdf):
             return fmt(r.site)
         return " + ".join(fmt(g.site) for g in r.groups) + f" = {fmt(r.site)}"
 
-    head = ["Группа на сайте", "Сайт, руб.", "xlsx, руб.", "Разница (сайт − xlsx)", "Ячейка xlsx", "Примечание"]
+    def students_cell(r):  # кто именно: «Петров В. Г.: сайт 45 000,00 / xlsx 45 105,00»
+        lines = [f"{s if s != '—' else x}: сайт {fmt(a)} / xlsx {fmt(b)}" for s, x, a, b, _ in r.students[:8]]
+        if len(r.students) > 8:
+            lines.append(f"… ещё {len(r.students) - 8} — в разделе «Расхождения по ученикам»")
+        return "\n".join(lines) or r.students_note
+
+    head = ["Группа на сайте", "Сайт, руб.", "xlsx, руб.", "Разница (сайт − xlsx)", "Ученики с расхождением", "Ячейка xlsx", "Примечание"]
     doc.add_heading("Расхождения", level=2)
     diffs = [r for r in rows if r.status in PROBLEM]
     if diffs:
-        _table(doc, head, [[groups_cell(r), site_cell(r), fmt(r.xlsx), fmt(r.diff), cells_cell(r), r.note] for r in diffs])
+        _table(doc, head, [[groups_cell(r), site_cell(r), fmt(r.xlsx), fmt(r.diff), students_cell(r), cells_cell(r),
+                            r.note or (STATUS[r.status] if r.status == "students" else "")] for r in diffs])
     else:
         doc.add_paragraph("Расхождений не найдено.")
 
-    detailed = [r for r in diffs if r.students or r.students_note]
+    detailed = [r for r in diffs if r.students]
     if detailed:
         doc.add_heading("Расхождения по ученикам", level=2)
         for r in detailed:
@@ -626,6 +649,10 @@ def write_report(path, rows, links, skipped, problems, xlsx, pdf):
                 doc.add_paragraph(r.students_note)
 
     other = [r for r in rows if r.status in ("ambiguous", "error")]
+    typos = [(g, s, x) for r in rows for s, x in r.typos for g in [" + ".join(g.name for g in r.groups)]]
+    if typos:
+        doc.add_heading("Возможные опечатки в ФИО (суммы совпадают)", level=2)
+        _table(doc, ["Группа на сайте", "На сайте", "В xlsx"], [list(t) for t in typos])
     if other:
         doc.add_heading("Не удалось сверить", level=2)
         _table(doc, ["Группа на сайте", "Сайт, руб.", "Статус", "Причина"],
@@ -658,8 +685,9 @@ def run(xlsx, pdf, web, out=None, progress=lambda i, n, msg: None, site=SITE):
 
 def summary(rows):
     n = {s: sum(len(r.groups) for r in rows if r.status == s) for s in STATUS}
-    return (f"Групп: {sum(n.values())}. Совпадает: {n['ok']}. Расхождений: {n['diff'] + n['missing']}"
-            f" (из них нет в xlsx: {n['missing']}). Нет в xlsx при нуле на сайте: {n['empty']}."
+    return (f"Групп: {sum(n.values())}. Совпадает: {n['ok']}. Расхождений: {n['diff'] + n['missing'] + n['students']}"
+            f" (из них нет в xlsx: {n['missing']}; сумма сходится, но не по ученикам: {n['students']})."
+            f" Нет в xlsx при нуле на сайте: {n['empty']}."
             f" Неоднозначно: {n['ambiguous']}. Ошибок загрузки: {n['error']}.")
 
 
