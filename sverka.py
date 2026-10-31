@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
+import egespace
+
 import docx
 import openpyxl
 import pypdf
@@ -808,6 +810,14 @@ pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; p
 <div class="row"><button id="rep" onclick="report()">Отчет</button>
   <input type="date" id="dfrom"> — <input type="date" id="dto">
   <span>одна дата или диапазон; нужна только таблица xlsx</span></div>
+<hr>
+<div class="row"><b>egespace.ru</b>
+  <input id="eslogin" placeholder="логин" size="12"><input id="espass" type="password" placeholder="пароль" size="12"></div>
+<div class="row"><button id="bk" onclick="backup()">Бэкап предметов</button>
+  <input id="esids" placeholder="ид курсов через запятую" size="26">
+  <span>пустое поле — все предметы</span></div>
+<div class="row"><button id="rs" onclick="restore()">Восстановить из бэкапа…</button>
+  <span>папка с датой внутри egespace_backup; предметы создадутся заново</span></div>
 <progress id="bar" value="0" max="1"></progress>
 <pre id="log"></pre>
 <script>
@@ -816,7 +826,27 @@ async function pick(kind) {
   const path = await pywebview.api.pick(kind);
   if (path) { files[kind] = path; document.getElementById(kind).textContent = path; }
 }
-function busy(on) { for (const id of ["go", "rep"]) document.getElementById(id).disabled = on; }
+function busy(on) { for (const id of ["go", "rep", "bk", "rs"]) document.getElementById(id).disabled = on; }
+function esCreds() {
+  const login = document.getElementById("eslogin").value.trim();
+  const pass = document.getElementById("espass").value;
+  if (!login || !pass) { say("Укажите логин и пароль egespace.ru."); return null; }
+  return [login, pass];
+}
+function backup() {
+  const c = esCreds(); if (!c) return;
+  busy(true);
+  document.getElementById("log").textContent = "";
+  pywebview.api.backup(c[0], c[1], document.getElementById("esids").value);
+}
+async function restore() {
+  const c = esCreds(); if (!c) return;
+  const folder = await pywebview.api.pick("folder");
+  if (!folder) return;
+  busy(true);
+  document.getElementById("log").textContent = "";
+  pywebview.api.restore(c[0], c[1], folder);
+}
 function go() {
   if (!files.xlsx || !files.pdf) { say("Выберите таблицу xlsx и PDF."); return; }
   busy(true);
@@ -857,9 +887,35 @@ class Api:  # методы доступны странице приложени�
     _win = None
 
     def pick(self, kind):
+        if kind == "folder":
+            paths = self._win.create_file_dialog(webview.FileDialog.FOLDER)
+            return paths[0] if paths else None
         types = ("Excel (*.xlsx)",) if kind == "xlsx" else ("PDF (*.pdf)",)
         paths = self._win.create_file_dialog(webview.FileDialog.OPEN, file_types=types)
         return paths[0] if paths else None
+
+    def backup(self, login, password, ids):
+        threading.Thread(target=self._egespace, args=("backup", login, password, ids), daemon=True).start()
+
+    def restore(self, login, password, folder):
+        threading.Thread(target=self._egespace, args=("restore", login, password, folder), daemon=True).start()
+
+    def _egespace(self, what, login, password, arg):
+        say = lambda msg: self._js("say", msg)
+        try:
+            if what == "backup":
+                ids = [int(x) for x in re.split(r"[^0-9]+", arg) if x]
+                out = egespace.backup(login, password, ids, say=say)
+                try:
+                    open_file(out)
+                except OSError:
+                    pass
+            else:
+                egespace.restore(login, password, arg, say=say)
+        except Exception as e:
+            say(f"Ошибка: {e if isinstance(e, (egespace.ApiError, ValueError)) else f'{type(e).__name__}: {e}'}")
+        finally:
+            self._js("done")
 
     def start(self, xlsx, pdf):
         threading.Thread(target=self._work, args=(xlsx, pdf), daemon=True).start()
