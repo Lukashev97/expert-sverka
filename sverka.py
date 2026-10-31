@@ -29,6 +29,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import egespace
+import shkolkovo
 
 import docx
 import openpyxl
@@ -819,6 +820,22 @@ pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; p
 <div class="row"><button id="bkdir" onclick="pickOut()">Папка для копии…</button><span id="esout"></span></div>
 <div class="row"><button id="rs" onclick="restore()">Восстановить из бэкапа…</button>
   <span>папка с датой внутри egespace_backup; предметы создадутся заново</span></div>
+<hr>
+<div class="row"><b>Школково</b><span>логин и пароль берутся из полей выше — у egespace.ru и worldofege.ru общая учётка</span></div>
+<div class="row"><button id="shq" onclick="addQuestions()">Задачи в тест</button>
+  <input id="shsrc" placeholder="тема Школково: https://3.shkolkovo.online/catalog/13539" size="34">
+  <input id="shdst" placeholder="тест: https://egespace.ru/extendedTests/…" size="30"></div>
+<div class="row"><span style="width:7em"></span><input id="shnums" placeholder="номера: 1-15" size="12">
+  <input id="shpts" type="number" min="1" value="1" size="3" title="баллов за задание">
+  <select id="shtype">
+    <option value="directComparison">прямое сравнение</option>
+    <option value="set">символы в любом порядке</option>
+    <option value="sequence">символы по порядку</option>
+  </select>
+  <span>пустые номера — вся тема</span></div>
+<div class="row"><button id="shl" onclick="uploadLessons()">Выгрузить сборник Дощинского</button>
+  <input id="shtasks" placeholder="задания ЕГЭ: 1-26" size="12">
+  <span>уроки и тесты в курсе 35, раздел «Задания»; пусто — все №1–26</span></div>
 <progress id="bar" value="0" max="1"></progress>
 <pre id="log"></pre>
 <script>
@@ -827,7 +844,7 @@ async function pick(kind) {
   const path = await pywebview.api.pick(kind);
   if (path) { files[kind] = path; document.getElementById(kind).textContent = path; }
 }
-function busy(on) { for (const id of ["go", "rep", "bk", "rs"]) document.getElementById(id).disabled = on; }
+function busy(on) { for (const id of ["go", "rep", "bk", "rs", "shq", "shl"]) document.getElementById(id).disabled = on; }
 function esCreds() {
   const login = document.getElementById("eslogin").value.trim();
   const pass = document.getElementById("espass").value;
@@ -843,6 +860,21 @@ function backup() {
   busy(true);
   document.getElementById("log").textContent = "";
   pywebview.api.backup(c[0], c[1], document.getElementById("esids").value, files.esout || "");
+}
+function val(id) { return document.getElementById(id).value.trim(); }
+function addQuestions() {
+  const c = esCreds(); if (!c) return;
+  if (!val("shsrc") || !val("shdst")) { say("Укажите ссылку на тему Школково и на тест."); return; }
+  busy(true);
+  document.getElementById("log").textContent = "";
+  pywebview.api.add_questions(c[0], c[1], val("shsrc"), val("shdst"), val("shnums"),
+                              Number(val("shpts")) || 1, val("shtype"));
+}
+function uploadLessons() {
+  const c = esCreds(); if (!c) return;
+  busy(true);
+  document.getElementById("log").textContent = "";
+  pywebview.api.upload_lessons(c[0], c[1], val("shtasks"));
 }
 async function restore() {
   const c = esCreds(); if (!c) return;
@@ -902,6 +934,23 @@ class Api:  # методы доступны странице приложени�
 
     def backup(self, login, password, ids, out=""):
         threading.Thread(target=self._egespace, args=("backup", login, password, ids, out), daemon=True).start()
+
+    def add_questions(self, login, password, source, target, nums, points, subtype):
+        self._run(shkolkovo.add_questions, login, password, source, target, nums, points, subtype)
+
+    def upload_lessons(self, login, password, tasks):
+        self._run(shkolkovo.upload_lessons, login, password, tasks)
+
+    def _run(self, fn, *args):
+        def job():
+            log = egespace.Log(lambda msg: self._js("say", msg))
+            try:
+                fn(*args, log=log)
+            except Exception as e:
+                log.fail(str(e) if isinstance(e, (egespace.ApiError, ValueError)) else f"{type(e).__name__}: {e}")
+            finally:
+                self._js("done")
+        threading.Thread(target=job, daemon=True).start()
 
     def backup_dir(self):
         return egespace.default_out()
