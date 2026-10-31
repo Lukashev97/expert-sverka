@@ -89,9 +89,14 @@ def backup(user, password, course_ids=(), out="egespace_backup", say=print):
     if course_ids:
         wanted = set(course_ids)
         courses = [c for c in courses if c["id"] in wanted]
-        missing = sorted(wanted - {c["id"] for c in courses})
-        if missing:
-            say("Нет таких предметов: %s" % ", ".join(map(str, missing)))
+        for cid in sorted(wanted - {c["id"] for c in courses}):
+            # /metadata показывает не всё (например, только что созданные предметы) —
+            # спрашиваем про такой id напрямую
+            node = next(iter(walk(_req("/content", token, {"course_id": cid}), "course")), None)
+            if node:
+                courses.append(node)
+            else:
+                say("Нет такого предмета: %s" % cid)
     if not courses:
         raise ApiError("нечего выгружать")
 
@@ -104,10 +109,28 @@ def backup(user, password, course_ids=(), out="egespace_backup", say=print):
     return os.path.abspath(root)
 
 
+def _description(token, kind, struct_id):
+    try:
+        return _req("/structure/description/%s/%s/exists" % (kind, struct_id), token, retries=1)
+    except ApiError:  # описания может не быть — тогда ручка отдаёт Not Found
+        return None
+
+
 def _backup_course(token, course, root, say):
     tree = _req("/content", token, {"course_id": course["id"]})
     dest = os.path.join(root, "course_%s_%s" % (course["id"], slug(course.get("name"))))
     _save(os.path.join(dest, "course.json"), tree)
+    # картинка, цвет, заголовок и преподаватель курса лежат в самом дереве,
+    # отдельно нужны только тексты описаний и список преподавателей
+    extras = {"descriptions": {}, "teachers": {}}
+    for kind in ("course", "subject", "lesson"):
+        for node in walk(tree, kind):
+            desc = _description(token, kind, node["id"])
+            if desc:
+                extras["descriptions"]["%s/%s" % (kind, node["id"])] = desc
+    for node in walk(tree, "course"):
+        extras["teachers"][str(node["id"])] = _req("/structure/course/%s/teachers/get" % node["id"], token)
+    _save(os.path.join(dest, "extras.json"), extras)
     lessons = list(walk(tree, "lesson"))
     for i, lesson in enumerate(lessons, 1):
         say("   урок %d/%d: %s" % (i, len(lessons), lesson.get("name")))
@@ -197,17 +220,71 @@ def _restore_course(token, course_dir, say):
             os.path.isdir(os.path.join(course_dir, "lessons")) else []:
         files[int(entry.split("_", 1)[0])] = os.path.join(course_dir, "lessons", entry)
 
+    extras_path = os.path.join(course_dir, "extras.json")
+    extras = {}
+    if os.path.exists(extras_path):
+        with open(extras_path, encoding="utf-8") as f:
+            extras = json.load(f)
+    palette = {c.get("id") for c in (_req("/structure/course/colour/get", token) or [])}
+
     for course in walk(tree, "course"):
         cid = _create(token, "course", course.get("name"))
         say("   предмет «%s» -> id %s" % (course.get("name"), cid))
+        _restore_look(token, "course", course, cid, extras, palette, say)
+        teachers = extras.get("teachers", {}).get(str(course["id"]))
+        if isinstance(teachers, list) and teachers:
+            ids = [t["id"] for t in teachers if isinstance(t, dict) and t.get("id")]
+            try:
+                _req("/structure/course/%s/teachers/update" % cid, token, method="POST", body=ids)
+            except ApiError as e:
+                say("      ! преподаватели: %s" % e)
         for subject in walk(course.get("contents") or [], "subject"):
             sid = _create(token, "subject", subject.get("name"), cid)
+            _restore_look(token, "subject", subject, sid, extras, palette, say)
             for lesson in walk(subject.get("contents") or [], "lesson"):
                 lid = _create(token, "lesson", lesson.get("name"), sid)
+                _restore_look(token, "lesson", lesson, lid, extras, palette, say)
                 src = files.get(lesson["id"])
                 if src:
                     _restore_media(token, src, lid, say)
                     _restore_tests(token, src, lid, say)
+
+
+def _restore_look(token, kind, node, new_id, extras, palette, say):
+    """Описание, заголовок, картинка, цвет, преподаватель и «детали курса» узла.
+    Всё это живёт в одной ручке description/update и перезаписывается целиком."""
+    desc = extras.get("descriptions", {}).get("%s/%s" % (kind, node["id"])) or {}
+    body = {}
+    if desc.get("text"):
+        body["text"] = desc["text"]
+    if node.get("title"):
+        body["title"] = node["title"]
+    if (node.get("image") or {}).get("id"):
+        body["image"] = {"id": node["image"]["id"]}
+    if node.get("course_details"):
+        body["course_details"] = node["course_details"]
+    if (node.get("colour") or {}).get("id") in palette and (node.get("colour") or {}).get("id"):
+        body["colour"] = {"id": node["colour"]["id"]}  # цвет не из палитры сервер не принимает
+    teacher = node.get("teacher") or {}
+    if teacher.get("id"):
+        body["teacher"] = {"id": teacher["id"], "name": teacher.get("name") or ""}
+    if not body:
+        return
+    try:
+        _req("/structure/description/%s/%s/create" % (kind, new_id), token, method="POST")
+    except ApiError:
+        pass  # описание уже есть — нормально
+    try:
+        _req("/structure/description/%s/%s/update" % (kind, new_id), token, method="POST", body=body)
+    except ApiError as e:
+        if "teacher" not in body:
+            return say("      ! оформление %s %s: %s" % (kind, new_id, e))
+        body.pop("teacher")  # у преподавателя нет профиля на этом сервере
+        try:
+            _req("/structure/description/%s/%s/update" % (kind, new_id), token, method="POST", body=body)
+            say("      ! преподаватель «%s» не перенесён: %s" % (teacher.get("name"), e))
+        except ApiError as e2:
+            say("      ! оформление %s %s: %s" % (kind, new_id, e2))
 
 
 def _restore_media(token, lesson_dir, lesson_id, say):
