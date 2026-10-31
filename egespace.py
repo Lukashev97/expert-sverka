@@ -21,6 +21,32 @@ class ApiError(Exception):
     pass
 
 
+class Log:
+    """Печатает статус в окно и дублирует его в файл рядом с копией."""
+
+    def __init__(self, say, path=None):
+        self.say, self.path, self.counts = say, path, {}
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def __call__(self, msg, *, count=None, n=1):
+        if count:
+            self.counts[count] = self.counts.get(count, 0) + n
+        line = "%s  %s" % (time.strftime("%H:%M:%S"), msg)
+        self.say(line)
+        if self.path:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def fail(self, msg):
+        self(("! " + msg), count="ошибки")
+
+    def total(self, head):
+        order = ["предметы", "разделы", "уроки", "медиа", "файлы", "вопросы", "тесты", "ошибки"]
+        parts = ["%s: %s" % (k, self.counts[k]) for k in order if self.counts.get(k)]
+        self("%s — %s" % (head, ", ".join(parts) if parts else "ничего не сделано"))
+
+
 def _req(path, token=None, params=None, method="GET", body=None, binary=False, retries=3):
     url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
     data = None
@@ -108,11 +134,17 @@ def backup(user, password, course_ids=(), out=None, say=print):
         raise ApiError("нечего выгружать")
 
     root = os.path.join(out, time.strftime("%Y%m%d-%H%M%S"))
+    log = Log(say, os.path.join(root, "backup.log"))
+    log("Копия в %s" % os.path.abspath(root))
     _save(os.path.join(root, "metadata.json"), meta)
     for n, course in enumerate(courses, 1):
-        say("[%d/%d] %s (id %s)" % (n, len(courses), course.get("name"), course["id"]))
-        _backup_course(token, course, root, say)
-    say("Готово: %s" % os.path.abspath(root))
+        log("[%d/%d] предмет «%s» (id %s)" % (n, len(courses), course.get("name"), course["id"]),
+            count="предметы")
+        try:
+            _backup_course(token, course, root, log)
+        except ApiError as e:
+            log.fail("предмет %s не выгружен: %s" % (course["id"], e))
+    log.total("Готово")
     return os.path.abspath(root)
 
 
@@ -123,7 +155,7 @@ def _description(token, kind, struct_id):
         return None
 
 
-def _backup_course(token, course, root, say):
+def _backup_course(token, course, root, log):
     tree = _req("/content", token, {"course_id": course["id"]})
     dest = os.path.join(root, "course_%s_%s" % (course["id"], slug(course.get("name"))))
     _save(os.path.join(dest, "course.json"), tree)
@@ -136,21 +168,38 @@ def _backup_course(token, course, root, say):
             if desc:
                 extras["descriptions"]["%s/%s" % (kind, node["id"])] = desc
     for node in walk(tree, "course"):
-        extras["teachers"][str(node["id"])] = _req("/structure/course/%s/teachers/get" % node["id"], token)
+        try:  # у курса без преподавателей ручка отвечает 404 — это не ошибка
+            extras["teachers"][str(node["id"])] = _req(
+                "/structure/course/%s/teachers/get" % node["id"], token, retries=1)
+        except ApiError:
+            extras["teachers"][str(node["id"])] = []
     _save(os.path.join(dest, "extras.json"), extras)
+    log("   оформление: описаний %d, разделов %d" % (len(extras["descriptions"]), len(list(walk(tree, "subject")))),
+        count="разделы", n=len(list(walk(tree, "subject"))))
     lessons = list(walk(tree, "lesson"))
     for i, lesson in enumerate(lessons, 1):
-        say("   урок %d/%d: %s" % (i, len(lessons), lesson.get("name")))
-        _backup_lesson(token, lesson, os.path.join(dest, "lessons"))
+        try:
+            got = _backup_lesson(token, lesson, os.path.join(dest, "lessons"), log)
+        except ApiError as e:
+            log.fail("урок %s не выгружен: %s" % (lesson["id"], e))
+            continue
+        log("   урок %d/%d «%s»: медиа %d (файлов %d), вопросов %d, тестов %d"
+            % (i, len(lessons), lesson.get("name"), got["медиа"], got["файлы"],
+               got["вопросы"], got["тесты"]), count="уроки")
+        for k, v in got.items():
+            if v:
+                log.counts[k] = log.counts.get(k, 0) + v
 
 
-def _backup_lesson(token, lesson, lessons_dir):
+def _backup_lesson(token, lesson, lessons_dir, log):
     lid = lesson["id"]
     base = os.path.join(lessons_dir, "%s_%s" % (lid, slug(lesson.get("name"))))
     data = {"lesson": lesson, "media": {}, "tests": {}}
+    got = {"медиа": 0, "файлы": 0, "вопросы": 0, "тесты": 0}
     for mt in MEDIA_TYPES:
         items = _req("/media/%s/get_order" % mt, token, {"lesson_id": lid}) or []
         data["media"][mt] = items
+        got["медиа"] += len(items)
         if mt not in FILE_MEDIA:
             continue
         for it in items:
@@ -158,10 +207,15 @@ def _backup_lesson(token, lesson, lessons_dir):
             if os.path.exists(path):
                 continue
             # у файлов авторизация идёт параметром jwt, заголовок тут отдаёт 422
-            blob = _req("/media/%s/%s/get" % (mt, it["id"]), None, {"jwt": token}, binary=True)
+            try:
+                blob = _req("/media/%s/%s/get" % (mt, it["id"]), None, {"jwt": token}, binary=True)
+            except ApiError as e:
+                log.fail("файл «%s» (%s %s): %s" % (it.get("name"), mt, it["id"], e))
+                continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(blob)
+            got["файлы"] += 1
     questions, test_ids = {}, set(lesson.get("extended_tests_ids") or [])
     for tt in TEST_TYPES:
         listing = _req("/test/get_available_tests_teacher", token,
@@ -170,11 +224,12 @@ def _backup_lesson(token, lesson, lessons_dir):
         for t in listing if isinstance(listing, list) else []:
             if isinstance(t, dict) and isinstance(t.get("id"), int):
                 test_ids.add(t["id"])
-        got = _req("/question/get_available_questions", token,
-                   {"lesson_id": lid, "test_type": tt}) or {}
-        for q in got.get("questions") or []:
+        avail = _req("/question/get_available_questions", token,
+                     {"lesson_id": lid, "test_type": tt}) or {}
+        for q in avail.get("questions") or []:
             questions[q["id"]] = q  # один вопрос виден и в exam, и в exercise
     data["questions"] = [questions[k] for k in sorted(questions)]
+    got["вопросы"], got["тесты"] = len(questions), len(test_ids)
     data["tests"]["details"] = {
         str(tid): {"metadata": _req("/test/%s/get_metadata" % tid, token),
                    "options": _req("/test/%s/get_options" % tid, token)}
@@ -194,6 +249,7 @@ def _backup_lesson(token, lesson, lessons_dir):
                 f.write(blob)
 
     _save(os.path.join(base, "lesson.json"), data)
+    return got
 
 
 # ---------- восстановление ----------
@@ -204,10 +260,15 @@ def restore(user, password, folder, say=print):
     courses = sorted(d for d in os.listdir(folder) if d.startswith("course_"))
     if not courses:
         raise ApiError("в папке нет выгруженных предметов (course_*)")
+    log = Log(say, os.path.join(folder, "restore.log"))
+    log("Восстанавливаю из %s" % os.path.abspath(folder))
     for n, name in enumerate(courses, 1):
-        say("[%d/%d] %s" % (n, len(courses), name))
-        _restore_course(token, os.path.join(folder, name), say)
-    say("Готово.")
+        log("[%d/%d] %s" % (n, len(courses), name))
+        try:
+            _restore_course(token, os.path.join(folder, name), log)
+        except (ApiError, OSError, ValueError) as e:
+            log.fail("%s не восстановлен: %s" % (name, e))
+    log.total("Готово")
 
 
 def _create(token, kind, name, parent_id=None):
@@ -219,7 +280,7 @@ def _create(token, kind, name, parent_id=None):
     return int(new_id)
 
 
-def _restore_course(token, course_dir, say):
+def _restore_course(token, course_dir, log):
     with open(os.path.join(course_dir, "course.json"), encoding="utf-8") as f:
         tree = json.load(f)
     files = {}  # id урока в бэкапе -> папка с его файлами
@@ -236,28 +297,31 @@ def _restore_course(token, course_dir, say):
 
     for course in walk(tree, "course"):
         cid = _create(token, "course", course.get("name"))
-        say("   предмет «%s» -> id %s" % (course.get("name"), cid))
-        _restore_look(token, "course", course, cid, extras, palette, say)
+        log("   предмет «%s» создан, id %s" % (course.get("name"), cid), count="предметы")
+        _restore_look(token, "course", course, cid, extras, palette, log)
         teachers = extras.get("teachers", {}).get(str(course["id"]))
         if isinstance(teachers, list) and teachers:
             ids = [t["id"] for t in teachers if isinstance(t, dict) and t.get("id")]
             try:
                 _req("/structure/course/%s/teachers/update" % cid, token, method="POST", body=ids)
+                log("   преподавателей назначено: %d" % len(ids))
             except ApiError as e:
-                say("      ! преподаватели: %s" % e)
+                log.fail("преподаватели: %s" % e)
         for subject in walk(course.get("contents") or [], "subject"):
             sid = _create(token, "subject", subject.get("name"), cid)
-            _restore_look(token, "subject", subject, sid, extras, palette, say)
+            log("   раздел «%s» создан, id %s" % (subject.get("name"), sid), count="разделы")
+            _restore_look(token, "subject", subject, sid, extras, palette, log)
             for lesson in walk(subject.get("contents") or [], "lesson"):
                 lid = _create(token, "lesson", lesson.get("name"), sid)
-                _restore_look(token, "lesson", lesson, lid, extras, palette, say)
+                log("      урок «%s» создан, id %s" % (lesson.get("name"), lid), count="уроки")
+                _restore_look(token, "lesson", lesson, lid, extras, palette, log)
                 src = files.get(lesson["id"])
                 if src:
-                    _restore_media(token, src, lid, say)
-                    _restore_tests(token, src, lid, say)
+                    _restore_media(token, src, lid, log)
+                    _restore_tests(token, src, lid, log)
 
 
-def _restore_look(token, kind, node, new_id, extras, palette, say):
+def _restore_look(token, kind, node, new_id, extras, palette, log):
     """Описание, заголовок, картинка, цвет, преподаватель и «детали курса» узла.
     Всё это живёт в одной ручке description/update и перезаписывается целиком."""
     desc = extras.get("descriptions", {}).get("%s/%s" % (kind, node["id"])) or {}
@@ -285,16 +349,16 @@ def _restore_look(token, kind, node, new_id, extras, palette, say):
         _req("/structure/description/%s/%s/update" % (kind, new_id), token, method="POST", body=body)
     except ApiError as e:
         if "teacher" not in body:
-            return say("      ! оформление %s %s: %s" % (kind, new_id, e))
+            return log.fail("оформление %s %s: %s" % (kind, new_id, e))
         body.pop("teacher")  # у преподавателя нет профиля на этом сервере
         try:
             _req("/structure/description/%s/%s/update" % (kind, new_id), token, method="POST", body=body)
-            say("      ! преподаватель «%s» не перенесён: %s" % (teacher.get("name"), e))
+            log.fail("преподаватель «%s» не перенесён: %s" % (teacher.get("name"), e))
         except ApiError as e2:
-            say("      ! оформление %s %s: %s" % (kind, new_id, e2))
+            log.fail("оформление %s %s: %s" % (kind, new_id, e2))
 
 
-def _restore_media(token, lesson_dir, lesson_id, say):
+def _restore_media(token, lesson_dir, lesson_id, log):
     with open(os.path.join(lesson_dir, "lesson.json"), encoding="utf-8") as f:
         data = json.load(f)
     for mt, items in (data.get("media") or {}).items():
@@ -309,15 +373,17 @@ def _restore_media(token, lesson_dir, lesson_id, say):
                         _req("/media/%s/upload" % mt, token,
                              {"lesson_id": lesson_id, "extension": it.get("extension") or "bin",
                               "name": it.get("name") or ""}, method="POST", body=f.read())
+                    log("         файл «%s» залит" % it.get("name"), count="файлы")
                 elif it.get("url"):
                     _req("/media/link/upload", token,
                          {"lesson_id": lesson_id, "name": it.get("name") or "", "url": it["url"]},
                          method="POST")
+                    log("         ссылка «%s» добавлена" % it.get("name"), count="медиа")
             except ApiError as e:
-                say("      ! %s «%s»: %s" % (mt, it.get("name"), e))
+                log.fail("%s «%s»: %s" % (mt, it.get("name"), e))
 
 
-def _restore_tests(token, lesson_dir, lesson_id, say):
+def _restore_tests(token, lesson_dir, lesson_id, log):
     """Вопросы урока, затем тесты. /question/create не возвращает id, поэтому
     после заливки читаем вопросы нового урока и сопоставляем по порядку."""
     with open(os.path.join(lesson_dir, "lesson.json"), encoding="utf-8") as f:
@@ -332,8 +398,9 @@ def _restore_tests(token, lesson_dir, lesson_id, say):
         try:
             _req("/question/create", token, method="POST", body=body)
             made.append(q)
+            log("         вопрос «%s…» создан" % str(q.get("text"))[:30], count="вопросы")
         except ApiError as e:
-            say("      ! вопрос «%s»: %s" % (str(q.get("text"))[:40], e))
+            log.fail("вопрос «%s»: %s" % (str(q.get("text"))[:40], e))
 
     fresh = (_req("/question/get_available_questions", token,
                   {"lesson_id": lesson_id, "test_type": "exercise"}) or {}).get("questions") or []
@@ -347,7 +414,7 @@ def _restore_tests(token, lesson_dir, lesson_id, say):
                     _req("/question/%s/image/upload" % new["id"], token, {"extension": "png"},
                          method="POST", body=f.read())
                 except ApiError as e:
-                    say("      ! картинка к вопросу %s: %s" % (q["id"], e))
+                    log.fail("картинка к вопросу %s: %s" % (q["id"], e))
 
     for tt in TEST_TYPES:
         for t in data.get("tests", {}).get(tt) or []:
@@ -365,8 +432,9 @@ def _restore_tests(token, lesson_dir, lesson_id, say):
             try:
                 _req("/test/create", token, {"parent_lesson_id": lesson_id, "test_type": tt},
                      method="POST", body=body)
+                log("         тест «%s» создан" % body["name"], count="тесты")
             except ApiError as e:
-                say("      ! тест «%s»: %s" % (body["name"], e))
+                log.fail("тест «%s»: %s" % (body["name"], e))
 
 
 def _selftest():
