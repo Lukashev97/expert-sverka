@@ -816,6 +816,7 @@ pre { background: #fff; border: 1px solid #ccc; height: 280px; overflow: auto; p
 <div class="row"><button id="bk" onclick="backup()">Бэкап предметов</button>
   <input id="esids" placeholder="ид курсов через запятую" size="26">
   <span>пустое поле — все предметы</span></div>
+<div class="row"><button id="bkdir" onclick="pickOut()">Папка для копии…</button><span id="esout"></span></div>
 <div class="row"><button id="rs" onclick="restore()">Восстановить из бэкапа…</button>
   <span>папка с датой внутри egespace_backup; предметы создадутся заново</span></div>
 <progress id="bar" value="0" max="1"></progress>
@@ -833,11 +834,15 @@ function esCreds() {
   if (!login || !pass) { say("Укажите логин и пароль egespace.ru."); return null; }
   return [login, pass];
 }
+async function pickOut() {
+  const path = await pywebview.api.pick("folder");
+  if (path) { files.esout = path; document.getElementById("esout").textContent = path; }
+}
 function backup() {
   const c = esCreds(); if (!c) return;
   busy(true);
   document.getElementById("log").textContent = "";
-  pywebview.api.backup(c[0], c[1], document.getElementById("esids").value);
+  pywebview.api.backup(c[0], c[1], document.getElementById("esids").value, files.esout || "");
 }
 async function restore() {
   const c = esCreds(); if (!c) return;
@@ -867,6 +872,7 @@ function say(msg) { const l = document.getElementById("log"); l.textContent += m
 function progress(i, n) { const b = document.getElementById("bar"); b.max = Math.max(n, 1); b.value = i; }
 function done() { busy(false); }
 async function checkUpdate() {
+  document.getElementById("esout").textContent = await pywebview.api.backup_dir();
   const u = await pywebview.api.check_update();
   if (!u) return;
   document.getElementById("updtext").textContent = "Доступна новая версия — сборка " + u.build + ".";
@@ -894,18 +900,21 @@ class Api:  # методы доступны странице приложени�
         paths = self._win.create_file_dialog(webview.FileDialog.OPEN, file_types=types)
         return paths[0] if paths else None
 
-    def backup(self, login, password, ids):
-        threading.Thread(target=self._egespace, args=("backup", login, password, ids), daemon=True).start()
+    def backup(self, login, password, ids, out=""):
+        threading.Thread(target=self._egespace, args=("backup", login, password, ids, out), daemon=True).start()
+
+    def backup_dir(self):
+        return egespace.default_out()
 
     def restore(self, login, password, folder):
         threading.Thread(target=self._egespace, args=("restore", login, password, folder), daemon=True).start()
 
-    def _egespace(self, what, login, password, arg):
+    def _egespace(self, what, login, password, arg, folder=""):
         say = lambda msg: self._js("say", msg)
         try:
             if what == "backup":
                 ids = [int(x) for x in re.split(r"[^0-9]+", arg) if x]
-                out = egespace.backup(login, password, ids, say=say)
+                out = egespace.backup(login, password, ids, folder or None, say=say)
                 try:
                     open_file(out)
                 except OSError:

@@ -81,8 +81,15 @@ def _save(path, obj):
 
 # ---------- бэкап ----------
 
-def backup(user, password, course_ids=(), out="egespace_backup", say=print):
+def default_out():
+    """Куда класть копию, если папку не выбрали: Документы, а не случайный CWD."""
+    docs = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(docs if os.path.isdir(docs) else os.path.expanduser("~"), "egespace_backup")
+
+
+def backup(user, password, course_ids=(), out=None, say=print):
     """course_ids пустой — выгружаются все предметы. Возвращает путь к папке бэкапа."""
+    out = out or default_out()
     token = login(user, password)
     meta = _req("/metadata", token) or {}
     courses = [c for c in meta.get("contents", []) if c.get("type") == "course"]
