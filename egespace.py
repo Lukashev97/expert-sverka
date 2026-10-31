@@ -40,7 +40,12 @@ def _req(path, token=None, params=None, method="GET", body=None, binary=False, r
                 raw = resp.read()
             if binary:
                 return raw
-            return json.loads(raw.decode("utf-8")) if raw else None
+            if not raw:
+                return None
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except ValueError:  # часть ручек отвечает обычным текстом («Вопрос успешно создан.»)
+                return raw.decode("utf-8", "replace")
         except Exception as e:  # сеть моргает чаще, чем ломается API
             if attempt == retries - 1:
                 raise ApiError("%s %s: %s" % (method, path, e)) from e
@@ -127,9 +132,37 @@ def _backup_lesson(token, lesson, lessons_dir):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(blob)
+    questions, test_ids = {}, set(lesson.get("extended_tests_ids") or [])
     for tt in TEST_TYPES:
-        data["tests"][tt] = _req("/test/get_available_tests_teacher", token,
-                                 {"test_type": tt, "lesson_id": lid})
+        listing = _req("/test/get_available_tests_teacher", token,
+                       {"test_type": tt, "lesson_id": lid})
+        data["tests"][tt] = listing
+        for t in listing if isinstance(listing, list) else []:
+            if isinstance(t, dict) and isinstance(t.get("id"), int):
+                test_ids.add(t["id"])
+        got = _req("/question/get_available_questions", token,
+                   {"lesson_id": lid, "test_type": tt}) or {}
+        for q in got.get("questions") or []:
+            questions[q["id"]] = q  # один вопрос виден и в exam, и в exercise
+    data["questions"] = [questions[k] for k in sorted(questions)]
+    data["tests"]["details"] = {
+        str(tid): {"metadata": _req("/test/%s/get_metadata" % tid, token),
+                   "options": _req("/test/%s/get_options" % tid, token)}
+        for tid in sorted(test_ids)}
+
+    for qid in sorted(questions):  # картинка к вопросу, если она есть
+        path = os.path.join(base, "files", "question_%s.png" % qid)
+        if os.path.exists(path):
+            continue
+        try:
+            blob = _req("/question/%s/image/get" % qid, None, {"jwt": token}, binary=True, retries=1)
+        except ApiError:
+            continue
+        if blob:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(blob)
+
     _save(os.path.join(base, "lesson.json"), data)
 
 
@@ -150,10 +183,10 @@ def restore(user, password, folder, say=print):
 def _create(token, kind, name, parent_id=None):
     res = _req("/structure/%s/create" % kind, token, method="POST",
                body={"name": name, "parentId": parent_id})
-    new_id = res.get("id") if isinstance(res, dict) else res
-    if not isinstance(new_id, int):
+    new_id = res.get("id") if isinstance(res, dict) else res  # API отдаёт id строкой
+    if not (isinstance(new_id, int) or (isinstance(new_id, str) and new_id.isdigit())):
         raise ApiError("создание %s %r не вернуло id: %r" % (kind, name, res))
-    return new_id
+    return int(new_id)
 
 
 def _restore_course(token, course_dir, say):
@@ -174,6 +207,7 @@ def _restore_course(token, course_dir, say):
                 src = files.get(lesson["id"])
                 if src:
                     _restore_media(token, src, lid, say)
+                    _restore_tests(token, src, lid, say)
 
 
 def _restore_media(token, lesson_dir, lesson_id, say):
@@ -197,6 +231,58 @@ def _restore_media(token, lesson_dir, lesson_id, say):
                          method="POST")
             except ApiError as e:
                 say("      ! %s «%s»: %s" % (mt, it.get("name"), e))
+
+
+def _restore_tests(token, lesson_dir, lesson_id, say):
+    """Вопросы урока, затем тесты. /question/create не возвращает id, поэтому
+    после заливки читаем вопросы нового урока и сопоставляем по порядку."""
+    with open(os.path.join(lesson_dir, "lesson.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    old = data.get("questions") or []
+    if not old:
+        return
+    made = []
+    for q in old:
+        body = {k: v for k, v in q.items() if k not in ("id", "creatorId")}
+        body["parentLessonId"] = lesson_id
+        try:
+            _req("/question/create", token, method="POST", body=body)
+            made.append(q)
+        except ApiError as e:
+            say("      ! вопрос «%s»: %s" % (str(q.get("text"))[:40], e))
+
+    fresh = (_req("/question/get_available_questions", token,
+                  {"lesson_id": lesson_id, "test_type": "exercise"}) or {}).get("questions") or []
+    ids = {}  # старый id вопроса -> новый
+    for q, new in zip(made, sorted(fresh, key=lambda x: x["id"])):
+        ids[q["id"]] = new["id"]
+        img = os.path.join(lesson_dir, "files", "question_%s.png" % q["id"])
+        if os.path.exists(img):
+            with open(img, "rb") as f:
+                try:
+                    _req("/question/%s/image/upload" % new["id"], token, {"extension": "png"},
+                         method="POST", body=f.read())
+                except ApiError as e:
+                    say("      ! картинка к вопросу %s: %s" % (q["id"], e))
+
+    for tt in TEST_TYPES:
+        for t in data.get("tests", {}).get(tt) or []:
+            if not isinstance(t, dict):
+                continue
+            body = {"name": t.get("name") or "Тест",
+                    "timeLimit": t.get("timeLimit", 0) or 0,
+                    "hideHints": bool(t.get("hideHints")),
+                    "hideAnswers": bool(t.get("hideAnswers")),
+                    "formationType": t.get("formationType") or "manual",
+                    "autoModeTestSize": t.get("autoModeTestSize") or len(ids) or 1,
+                    "autoModeAllowedDifficulties": t.get("autoModeAllowedDifficulties") or ["easy", "medium", "hard"],
+                    "manualModeQuestionIds": [ids[q] for q in (t.get("manualModeQuestionIds") or []) if q in ids],
+                    "isPublic": bool(t.get("isPublic"))}
+            try:
+                _req("/test/create", token, {"parent_lesson_id": lesson_id, "test_type": tt},
+                     method="POST", body=body)
+            except ApiError as e:
+                say("      ! тест «%s»: %s" % (body["name"], e))
 
 
 def _selftest():
