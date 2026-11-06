@@ -15,7 +15,6 @@ import html
 import json
 import os
 import re
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -697,10 +696,7 @@ def summary(rows):
 # ---------- обновление ----------
 
 def _tls():
-    # Собранное .app ищет сертификаты там, где они лежали у Python на машине сборки; на macOS берём системные.
-    if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem"):
-        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
-    return ssl.create_default_context()
+    return egespace.tls_context()
 
 
 def _http(url, timeout):
