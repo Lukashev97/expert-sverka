@@ -7,6 +7,8 @@ restore() — заливает такую папку обратно: курс �
 import json
 import os
 import re
+import ssl
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -15,6 +17,14 @@ API = "https://egespace.ru/api"
 MEDIA_TYPES = ("article", "podcast", "video", "link")
 FILE_MEDIA = ("article", "podcast")  # качаются как файлы, остальные — внешние ссылки
 TEST_TYPES = ("exam", "exercise")
+
+
+def tls_context():
+    """Собранное приложение ищет сертификаты там, где они лежали у Python на машине
+    сборки, и на чужой машине проверка падает — на macOS берём системные."""
+    if sys.platform == "darwin" and os.path.exists("/etc/ssl/cert.pem"):
+        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    return ssl.create_default_context()
 
 
 class ApiError(Exception):
@@ -62,7 +72,7 @@ def _req(path, token=None, params=None, method="GET", body=None, binary=False, r
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=180, context=tls_context()) as resp:
                 raw = resp.read()
             if binary:
                 return raw

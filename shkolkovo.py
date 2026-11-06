@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from html import escape, unescape
 
-from egespace import ApiError, Log  # noqa: F401  (Log нужен вызывающей стороне)
+from egespace import ApiError, Log, tls_context  # noqa: F401  (Log нужен вызывающей стороне)
 
 PLATFORMS = ("worldofege.ru", "egespace.ru")  # один и тот же движок, разные сайты и аккаунты
 SUBTYPES = ("directComparison", "sequence", "set")
@@ -27,7 +27,7 @@ def _fail(msg):
 
 def http(url, data=None, headers=None):
     req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=60, context=tls_context()) as r:
         return r.read().decode("utf-8")
 
 
