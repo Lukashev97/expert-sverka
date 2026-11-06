@@ -6,7 +6,9 @@
 - «Годовой курс», тарифы, «В деньгах» — сводка наверху листа «<ПРЕДМЕТ> ГК»: её же формулы COUNTA / COUNTIF / SUM,
   только по строкам с Датой не позже дня отчёта. Красные/серые (возвраты, ушедшие) стоят выше этих диапазонов.
   СВУ МВД — отдельная когорта, по дате не фильтруется.
-- «Стартер-пак» — нарастающим итогом с листа «<ПРЕДМЕТ> спецкурсы»; строки нет, если предмет его не продаёт.
+- «Полугодовой курс» — то же самое с листа «<ПРЕДМЕТ> ПГК»; строк нет, если на него ещё никто не записан.
+- «Стартер-пак», «Курс по итоговому сочинению» — нарастающим итогом с листа «<ПРЕДМЕТ> спецкурсы»;
+  строки нет, если предмет такой курс не продаёт. Остальные спецкурсы («На пересдачу») в отчёт не идут.
 """
 import datetime as dt
 import re
@@ -24,6 +26,8 @@ LOG_TITLE = {"ОБЩ": "Обществознание", "ИСТ": "История
 HEAD = {"ОБЩ": "🔵 ОБЩЕСТВОЗНАНИЕ", "ИСТ": "🟣 ИСТОРИЯ", "РУС": "🟠 РУССКИЙ ЯЗЫК", "МАТ": "🔵 МАТЕМАТИКА"}
 GEN = "января февраля марта апреля мая июня июля августа сентября октября ноября декабря".split()
 SVU = "СВУ МВД"
+# курс на листе «<ПРЕДМЕТ> спецкурсы» -> строка отчёта; остальных курсов в отчёте нет
+SPECIAL = {"Стартер-пак": "Стартер-пак", "Итоговое сочинение": "Курс по итоговому сочинению"}
 ZP = "ЗП 26-27"
 LAT2CYR = str.maketrans("ABCEHKMOPTXYaceopxy", "АВСЕНКМОРТХУасеорху")  # в листе «ПРO+ПА» с латинской O
 REFUND_FILLS = {"FFFFCFC9", "FFCFCECE", "FFD0CECE", "FFB7B7B7"}
@@ -118,14 +122,14 @@ class Book:
 
     # ---------- «<ПРЕДМЕТ> ГК» ----------
 
-    def _gk(self, wb, s):
-        ws = next((w for w in wb.worksheets if w.title.strip() == f"{s} ГК" and w.sheet_state == "visible"), None)
+    def _sheet(self, wb, s, kind):
+        ws = next((w for w in wb.worksheets if w.title.strip() == f"{s} {kind}" and w.sheet_state == "visible"), None)
         if ws is None:
-            raise ValueError(f"в таблице нет листа «{s} ГК»")
+            raise ValueError(f"в таблице нет листа «{s} {kind}»")
         return ws
 
-    def gk(self, s, day):
-        wv, wf = self._gk(self.v, s), self._gk(self.f, s)
+    def gk(self, s, day, kind="ГК"):
+        wv, wf = self._sheet(self.v, s, kind), self._sheet(self.f, s, kind)
         hdr = [c.value for c in wv[1]]
         if "Тариф" not in hdr:
             raise ValueError(f"на листе «{wv.title}» нет колонки «Тариф»")
@@ -162,15 +166,21 @@ class Book:
             tariffs.append((str(crit).strip().translate(LAT2CYR), k))
         return students, total, tariffs
 
-    def starter(self, s, day):
+    def specials(self, s, day):
+        """[(строка отчёта, сколько)] по листу «<ПРЕДМЕТ> спецкурсы» — только курсы из SPECIAL."""
         ws = next((w for w in self.v.worksheets if w.title.strip() == f"{s} спецкурсы"), None)
-        if ws is None or not any(str(c.value).strip() == "Стартер-пак"
-                                 for row in ws.iter_rows(min_row=2, max_col=5) for c in row if c.value):
-            return None  # предмет стартер-пак не продаёт — строки в отчёте нет
-        return sum(1 for r in range(2, ws.max_row + 1)
-                   if str(ws.cell(r, 4).value or "").strip() == "Стартер-пак"
-                   and (as_date(ws.cell(r, 1).value) or dt.date.max) <= day
-                   and not (_fill(ws.cell(r, 1)) in REFUND_FILLS and _fill(ws.cell(r, 2)) in REFUND_FILLS))
+        if ws is None:
+            return []
+        out = []
+        for course, title in SPECIAL.items():
+            rows = [r for r in range(2, ws.max_row + 1) if str(ws.cell(r, 4).value or "").strip() == course]
+            if not rows:
+                continue  # предмет такой курс не продаёт — строки в отчёте нет
+            out.append((title, sum(
+                1 for r in rows
+                if (as_date(ws.cell(r, 1).value) or dt.date.max) <= day
+                and not (_fill(ws.cell(r, 1)) in REFUND_FILLS and _fill(ws.cell(r, 2)) in REFUND_FILLS))))
+        return out
 
     # ---------- текст ----------
 
@@ -195,9 +205,16 @@ class Book:
                     f"Годовой курс: {students}",
                     f"В деньгах: {money(total)}",
                     " / ".join(f"{k} {v}" for k, v in tariffs)]
-            sp = self.starter(s, day)
-            if sp is not None:
-                out += ["", f"Стартер-пак: {sp}"]
+            try:
+                half, half_total, half_tariffs = self.gk(s, day, "ПГК")
+            except ValueError:  # в таблице до ноября 2026 листов «ПГК» нет вовсе
+                half = 0
+            if half:  # на полугодовой курс ещё никого не записали — строк в отчёте нет
+                out += ["", f"Полугодовой курс: {half}",
+                        f"В деньгах: {money(half_total)}",
+                        " / ".join(f"{k} {v}" for k, v in half_tariffs)]
+            for title, n in self.specials(s, day):
+                out += ["", f"{title}: {n}"]
         return "\n".join(out)
 
 
