@@ -201,10 +201,21 @@ def _backup_course(token, course, root, log):
                 log.counts[k] = log.counts.get(k, 0) + v
 
 
+def _lesson_questions(token, lid):
+    """Вопросы старого банка урока; у новых курсов он пуст, задания лежат в тестах."""
+    out = {}
+    for tt in TEST_TYPES:
+        avail = _req("/question/get_available_questions", token,
+                     {"lesson_id": lid, "test_type": tt}) or {}
+        for q in avail.get("questions") or []:
+            out[q["id"]] = q  # один вопрос виден и в exam, и в exercise
+    return list(out.values())
+
+
 def _backup_lesson(token, lesson, lessons_dir, log):
     lid = lesson["id"]
     base = os.path.join(lessons_dir, "%s_%s" % (lid, slug(lesson.get("name"))))
-    data = {"lesson": lesson, "media": {}, "tests": {}}
+    data = {"lesson": lesson, "media": {}, "tests": []}
     got = {"медиа": 0, "файлы": 0, "вопросы": 0, "тесты": 0}
     for mt in MEDIA_TYPES:
         items = _req("/media/%s/get_order" % mt, token, {"lesson_id": lid}) or []
@@ -226,24 +237,17 @@ def _backup_lesson(token, lesson, lessons_dir, log):
             with open(path, "wb") as f:
                 f.write(blob)
             got["файлы"] += 1
-    questions, test_ids = {}, set(lesson.get("extended_tests_ids") or [])
-    for tt in TEST_TYPES:
-        listing = _req("/test/get_available_tests_teacher", token,
-                       {"test_type": tt, "lesson_id": lid})
-        data["tests"][tt] = listing
-        for t in listing if isinstance(listing, list) else []:
-            if isinstance(t, dict) and isinstance(t.get("id"), int):
-                test_ids.add(t["id"])
-        avail = _req("/question/get_available_questions", token,
-                     {"lesson_id": lid, "test_type": tt}) or {}
-        for q in avail.get("questions") or []:
-            questions[q["id"]] = q  # один вопрос виден и в exam, и в exercise
+    # Тесты урока — это «расширенные тесты» платформы: один запрос отдаёт их целиком,
+    # вместе с заданиями. Старые /test/* и /question/* ручки про них ничего не знают.
+    try:
+        tests = (_req("/extended-tests/all", token, {"lessonId": lid}, retries=1) or {}).get("tests") or []
+    except ApiError:  # у урока без тестов ручка отвечает 404 «Tests are not found»
+        tests = []
+    data["tests"] = tests
+    questions = {q["id"]: q for q in _lesson_questions(token, lid)}
     data["questions"] = [questions[k] for k in sorted(questions)]
-    got["вопросы"], got["тесты"] = len(questions), len(test_ids)
-    data["tests"]["details"] = {
-        str(tid): {"metadata": _req("/test/%s/get_metadata" % tid, token),
-                   "options": _req("/test/%s/get_options" % tid, token)}
-        for tid in sorted(test_ids)}
+    got["тесты"] = len(tests)
+    got["вопросы"] = sum(len(t.get("elements") or []) for t in tests) + len(questions)
 
     for qid in sorted(questions):  # картинка к вопросу, если она есть
         path = os.path.join(base, "files", "question_%s.png" % qid)
@@ -394,13 +398,30 @@ def _restore_media(token, lesson_dir, lesson_id, log):
 
 
 def _restore_tests(token, lesson_dir, lesson_id, log):
-    """Вопросы урока, затем тесты. /question/create не возвращает id, поэтому
-    после заливки читаем вопросы нового урока и сопоставляем по порядку."""
+    """Сначала вопросы старого банка урока, затем расширенные тесты с их заданиями."""
     with open(os.path.join(lesson_dir, "lesson.json"), encoding="utf-8") as f:
         data = json.load(f)
-    old = data.get("questions") or []
-    if not old:
-        return
+    _restore_questions(token, data.get("questions") or [], lesson_dir, lesson_id, log)
+    for t in data.get("tests") or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            _req("/extended-tests/create", token, method="POST", body={
+                "name": t.get("name") or "Тест",
+                "elements": t.get("elements") or [],
+                "view": {"autoUncompleted": bool((t.get("view") or {}).get("autoUncompleted"))},
+                "autoUncompleted": bool((t.get("view") or {}).get("autoUncompleted")),
+                "lessonId": str(lesson_id),
+            })
+            log("         тест «%s» создан, заданий %d" % (t.get("name"), len(t.get("elements") or [])),
+                count="тесты")
+        except ApiError as e:
+            log.fail("тест «%s»: %s" % (t.get("name"), e))
+
+
+def _restore_questions(token, old, lesson_dir, lesson_id, log):
+    """/question/create не возвращает id, поэтому после заливки читаем вопросы
+    нового урока и сопоставляем по порядку — это нужно картинкам."""
     made = []
     for q in old:
         body = {k: v for k, v in q.items() if k not in ("id", "creatorId")}
@@ -425,27 +446,6 @@ def _restore_tests(token, lesson_dir, lesson_id, log):
                          method="POST", body=f.read())
                 except ApiError as e:
                     log.fail("картинка к вопросу %s: %s" % (q["id"], e))
-
-    for tt in TEST_TYPES:
-        for t in data.get("tests", {}).get(tt) or []:
-            if not isinstance(t, dict):
-                continue
-            body = {"name": t.get("name") or "Тест",
-                    "timeLimit": t.get("timeLimit", 0) or 0,
-                    "hideHints": bool(t.get("hideHints")),
-                    "hideAnswers": bool(t.get("hideAnswers")),
-                    "formationType": t.get("formationType") or "manual",
-                    "autoModeTestSize": t.get("autoModeTestSize") or len(ids) or 1,
-                    "autoModeAllowedDifficulties": t.get("autoModeAllowedDifficulties") or ["easy", "medium", "hard"],
-                    "manualModeQuestionIds": [ids[q] for q in (t.get("manualModeQuestionIds") or []) if q in ids],
-                    "isPublic": bool(t.get("isPublic"))}
-            try:
-                _req("/test/create", token, {"parent_lesson_id": lesson_id, "test_type": tt},
-                     method="POST", body=body)
-                log("         тест «%s» создан" % body["name"], count="тесты")
-            except ApiError as e:
-                log.fail("тест «%s»: %s" % (body["name"], e))
-
 
 def _selftest():
     assert slug('a/b:c*?') == "a_b_c__" and slug("") == "unnamed"
