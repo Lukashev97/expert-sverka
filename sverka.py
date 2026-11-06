@@ -137,6 +137,8 @@ def load_xlsx(path):
         wb = openpyxl.load_workbook(path, data_only=True)  # значения
         wbf = openpyxl.load_workbook(path)  # формулы сводок — по ним видно, каких учеников складывает ячейка
     for ws in wb.worksheets:
+        if ws.sheet_state != "visible":  # скрытая копия листа давала «подходит несколько листов»
+            continue
         tokens = re.findall(r"[\wё-]+", ws.title.casefold())
         subject = next(filter(None, map(subject_of, tokens)), None)
         if not subject:
@@ -159,7 +161,7 @@ def load_xlsx(path):
             if value is None and students is not None:
                 value = sum((a for _, a, _ in students), ZERO)
             return value, students
-        if "гк" in tokens:
+        if "гк" in tokens or "пгк" in tokens:  # полугодовой курс устроен так же, как годовой
             # Шапка: месяцы дважды — сначала оплаты, потом тарифы. Сводка «подпись / сумма под ней»
             # стоит в колонках второго набора месяцев.
             cols = {}
