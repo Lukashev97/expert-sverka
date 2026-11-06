@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 import warnings
@@ -726,20 +727,29 @@ def check_update(api=RELEASES_API, build=BUILD):
         return find_update(json.load(r), build)
 
 
-def download(asset, dest, progress=lambda done, total: None):
-    """Скачивает файл релиза и сверяет размер и SHA-256 (GitHub отдаёт его в поле digest)."""
-    h, done, total = hashlib.sha256(), 0, asset["size"]
-    with _http(asset["browser_download_url"], 60) as r, open(dest, "wb") as f:
-        while chunk := r.read(1 << 16):
-            f.write(chunk)
-            h.update(chunk)
-            done += len(chunk)
-            if done == total or done % (1 << 20) < len(chunk):  # примерно раз в мегабайт
-                progress(done, total)
-    digest = asset.get("digest") or ""
-    if done != total or (digest.startswith("sha256:") and digest[7:] != h.hexdigest()):
-        os.remove(dest)
-        raise ValueError("скачанный файл повреждён — попробуйте ещё раз")
+def download(asset, dest, progress=lambda done, total: None, tries=3):
+    """Скачивает файл релиза и сверяет размер и SHA-256 (GitHub отдаёт его в поле digest).
+    Файлы релизов лежат на отдельном домене GitHub, до которого соединение рвётся чаще,
+    чем до самого API, — поэтому несколько попыток."""
+    for attempt in range(1, tries + 1):
+        try:
+            h, done, total = hashlib.sha256(), 0, asset["size"]
+            with _http(asset["browser_download_url"], 60) as r, open(dest, "wb") as f:
+                while chunk := r.read(1 << 16):
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if done == total or done % (1 << 20) < len(chunk):  # примерно раз в мегабайт
+                        progress(done, total)
+            digest = asset.get("digest") or ""
+            if done != total or (digest.startswith("sha256:") and digest[7:] != h.hexdigest()):
+                raise ValueError("скачанный файл повреждён")
+            return
+        except (OSError, ValueError) as e:
+            Path(dest).unlink(missing_ok=True)  # недокачанный файл подменять нельзя
+            if attempt == tries:
+                raise ValueError(f"{e}. Скачайте сборку вручную со страницы релиза") from None
+            time.sleep(2 * attempt)
 
 
 # Запущенный .exe нельзя перезаписать: подменяет cmd после нашего выхода и запускает новую версию.
@@ -1026,7 +1036,9 @@ class Api:  # методы доступны странице приложени�
             self._js("say", "Готово — программа перезапустится уже новой версией.")
             os._exit(0)
         except Exception as e:
-            self._js("say", f"Не удалось обновить: {e}")
+            self._js("say", f"Не удалось обновить: {e}. Открываю страницу релиза — скачайте "
+                            f"{asset_name()} и положите вместо старого файла.")
+            webbrowser.open(u["page"])
 
     def _work(self, xlsx, pdf):
         web = None
