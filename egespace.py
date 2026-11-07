@@ -95,7 +95,10 @@ def login(user, password):
 
 
 def slug(name, limit=60):
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip(" .")[:limit] or "unnamed"
+    # Windows не умеет имена, которые кончаются пробелом или точкой, — а обрезка по длине
+    # запросто оставляет их на конце, поэтому подрезаем ПОСЛЕ неё
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip()
+    return clean[:limit].strip(" .") or "unnamed"
 
 
 def walk(node, kind):
@@ -270,12 +273,19 @@ def _backup_lesson(token, lesson, lessons_dir, log):
 
 def restore(user, password, folder, say=print):
     """Создаёт на сайте копии предметов из папки бэкапа. Старые id не сохраняются."""
-    token = login(user, password)
     courses = sorted(d for d in os.listdir(folder) if d.startswith("course_"))
     if not courses:
-        raise ApiError("в папке нет выгруженных предметов (course_*)")
+        # выбрали корень egespace_backup, а копии лежат в папках с датой — берём свежую
+        dated = sorted(d for d in os.listdir(folder)
+                       if re.fullmatch(r"\d{8}-\d{6}", d)
+                       and any(x.startswith("course_") for x in os.listdir(os.path.join(folder, d))))
+        if not dated:
+            raise ApiError("в папке нет выгруженных предметов (course_*)")
+        folder = os.path.join(folder, dated[-1])
+        courses = sorted(d for d in os.listdir(folder) if d.startswith("course_"))
     log = Log(say, os.path.join(folder, "restore.log"))
     log("Восстанавливаю из %s" % os.path.abspath(folder))
+    token = login(user, password)
     for n, name in enumerate(courses, 1):
         log("[%d/%d] %s" % (n, len(courses), name))
         try:
@@ -449,6 +459,8 @@ def _restore_questions(token, old, lesson_dir, lesson_id, log):
 
 def _selftest():
     assert slug('a/b:c*?') == "a_b_c__" and slug("") == "unnamed"
+    assert slug("Логика, точность", 8) == "Логика,"  # Windows не примет хвостовой пробел
+    assert slug("Урок.") == "Урок"
     tree = {"type": "course", "contents": [
         {"type": "subject", "contents": [{"type": "lesson", "id": 1}]},
         {"type": "lesson", "id": 2}]}
