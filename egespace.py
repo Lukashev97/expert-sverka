@@ -52,7 +52,7 @@ class Log:
         self(("! " + msg), count="ошибки")
 
     def total(self, head):
-        order = ["предметы", "разделы", "уроки", "медиа", "файлы", "вопросы", "тесты", "ошибки"]
+        order = ["предметы", "разделы", "уроки", "медиа", "файлы", "вопросы", "тесты", "работы", "ошибки"]
         parts = ["%s: %s" % (k, self.counts[k]) for k in order if self.counts.get(k)]
         self("%s — %s" % (head, ", ".join(parts) if parts else "ничего не сделано"))
 
@@ -196,9 +196,9 @@ def _backup_course(token, course, root, log):
         except ApiError as e:
             log.fail("урок %s не выгружен: %s" % (lesson["id"], e))
             continue
-        log("   урок %d/%d «%s»: медиа %d (файлов %d), вопросов %d, тестов %d"
+        log("   урок %d/%d «%s»: медиа %d (файлов %d), вопросов %d, тестов %d, работ %d"
             % (i, len(lessons), lesson.get("name"), got["медиа"], got["файлы"],
-               got["вопросы"], got["тесты"]), count="уроки")
+               got["вопросы"], got["тесты"], got["работы"]), count="уроки")
         for k, v in got.items():
             if v:
                 log.counts[k] = log.counts.get(k, 0) + v
@@ -219,7 +219,7 @@ def _backup_lesson(token, lesson, lessons_dir, log):
     lid = lesson["id"]
     base = os.path.join(lessons_dir, "%s_%s" % (lid, slug(lesson.get("name"))))
     data = {"lesson": lesson, "media": {}, "tests": []}
-    got = {"медиа": 0, "файлы": 0, "вопросы": 0, "тесты": 0}
+    got = {"медиа": 0, "файлы": 0, "вопросы": 0, "тесты": 0, "работы": 0}
     for mt in MEDIA_TYPES:
         items = _req("/media/%s/get_order" % mt, token, {"lesson_id": lid}) or []
         data["media"][mt] = items
@@ -247,6 +247,11 @@ def _backup_lesson(token, lesson, lessons_dir, log):
     except ApiError:  # у урока без тестов ручка отвечает 404 «Tests are not found»
         tests = []
     data["tests"] = tests
+    try:  # работы учеников по этому уроку; у урока без работ ручка отвечает 404
+        data["works"] = _req("/extended-tests/get-works", token, {"lessonId": lid}, retries=1)
+    except ApiError:
+        data["works"] = None
+    got["работы"] = len(data["works"] or []) if isinstance(data["works"], list) else 0
     questions = {q["id"]: q for q in _lesson_questions(token, lid)}
     data["questions"] = [questions[k] for k in sorted(questions)]
     got["тесты"] = len(tests)
